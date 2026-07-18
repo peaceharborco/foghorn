@@ -1,0 +1,39 @@
+// Copy this file to wrangler.jsonc and fill in your values.
+// wrangler.jsonc is gitignored so your phone numbers and URLs stay out of git.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "down-detector",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-05-01",
+  "observability": { "enabled": true },
+  "triggers": {
+    // every minute — cron's finest granularity
+    "crons": ["* * * * *"]
+  },
+  "vars": {
+    // One or more URLs to watch, comma-separated. Each gets its own
+    // independent failure streak and its own alerts.
+    "CHECK_URLS": "https://example.com, https://status.example.org/health",
+
+    // How many consecutive failed checks before a DOWN alert (default 2).
+    "FAIL_THRESHOLD": "2",
+
+    // --- Notifiers: configure at least one. Both may be active at once. ---
+
+    // Twilio SMS. Also requires two secrets (see below).
+    "TWILIO_FROM": "+15555550100",
+    "TWILIO_TO": "+15555550101",
+
+    // Generic webhook: POSTs JSON on every transition. The payload includes
+    // both "text" and "content" keys, so a Slack or Discord webhook URL works
+    // here as-is. Remove if unused.
+    "WEBHOOK_URL": "https://hooks.slack.com/services/XXX/YYY/ZZZ"
+  },
+  "kv_namespaces": [
+    // id is filled in after `wrangler kv namespace create STATE`
+    { "binding": "STATE", "id": "YOUR_KV_NAMESPACE_ID" }
+  ]
+  // Twilio secrets (only if using SMS):
+  //   wrangler secret put TWILIO_ACCOUNT_SID
+  //   wrangler secret put TWILIO_AUTH_TOKEN
+}

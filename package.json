@@ -1,0 +1,19 @@
+{
+  "name": "down-detector",
+  "version": "1.0.0",
+  "private": true,
+  "description": "The smallest possible dead-man watchdog: a cron-triggered Cloudflare Worker that texts you when your server goes down. One file, no dashboard, free tier forever.",
+  "license": "MIT",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev --test-scheduled --remote",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5",
+    "typescript": "^5",
+    "vitest": "^3",
+    "wrangler": "^4"
+  }
+}

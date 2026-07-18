@@ -1,0 +1,8 @@
+# Your real config (copy wrangler.jsonc.example to wrangler.jsonc) — never commit it
+wrangler.jsonc
+
+node_modules/
+.wrangler/
+.dev.vars
+*.log
+.DS_Store
