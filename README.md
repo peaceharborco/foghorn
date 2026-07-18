@@ -25,8 +25,13 @@ you two texts, not 360.
 State lives in Workers KV and is written **only when something changes**. A
 healthy server does *zero* KV writes — which matters, because Cloudflare's free
 tier allows 1,000 KV writes/day and a naive write-every-minute monitor burns
-1,440. This one idles at 2,880 *reads*/day per URL against a 100,000/day read
+1,440. This one idles at 1,440 *reads*/day per URL against a 100,000/day read
 quota. It runs free, forever, and never gets close to the limits.
+
+And because it's a dead-man alarm, delivery is part of the state machine: if
+every configured notifier fails to send (Twilio rejects, webhook 500s), the
+transition is **not** committed — the Worker retries the alert on the next
+cron run until one notifier actually delivers.
 
 Two notifiers, use either or both:
 

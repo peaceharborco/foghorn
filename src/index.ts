@@ -45,7 +45,12 @@ export default {
       return;
     }
     const threshold = Math.max(1, parseInt(env.FAIL_THRESHOLD ?? "2", 10) || 2);
-    await Promise.all(urls.map((url) => checkOne(env, url, threshold)));
+    // Each URL is isolated: one URL's failed alert delivery must not stop the
+    // others from being checked. Surface the first failure so the cron run
+    // still reports an error in observability.
+    const results = await Promise.allSettled(urls.map((url) => checkOne(env, url, threshold)));
+    const failed = results.find((r): r is PromiseRejectedResult => r.status === "rejected");
+    if (failed) throw failed.reason;
   },
 };
 
@@ -106,7 +111,7 @@ async function loadState(env: Env, url: string): Promise<State> {
     const s = JSON.parse(raw) as Partial<State>;
     return {
       status: s.status === "down" ? "down" : "up",
-      fails: typeof s.fails === "number" && s.fails >= 0 ? s.fails : 0,
+      fails: Number.isInteger(s.fails) && (s.fails as number) >= 0 ? (s.fails as number) : 0,
     };
   } catch {
     return { status: "up", fails: 0 };
@@ -132,6 +137,12 @@ async function isReachable(url: string): Promise<boolean> {
   }
 }
 
+/**
+ * Delivers the alert through every configured notifier. Throws when ALL of
+ * them fail, so the caller skips the state write and the alert is retried on
+ * the next cron run — a dead-man alarm must never mark an alert delivered
+ * when nobody heard it.
+ */
 async function notify(env: Env, body: string): Promise<void> {
   const tasks: Promise<void>[] = [];
   if (env.TWILIO_ACCOUNT_SID && env.TWILIO_AUTH_TOKEN && env.TWILIO_FROM && env.TWILIO_TO) {
@@ -144,7 +155,10 @@ async function notify(env: Env, body: string): Promise<void> {
     console.error(`down-detector: no notifier configured — dropped alert: ${body}`);
     return;
   }
-  await Promise.all(tasks);
+  const results = await Promise.allSettled(tasks);
+  if (results.every((r) => r.status === "rejected")) {
+    throw new Error(`down-detector: every notifier failed — alert will retry next run: ${body}`);
+  }
 }
 
 async function sendSms(env: Env, body: string): Promise<void> {
@@ -165,6 +179,7 @@ async function sendSms(env: Env, body: string): Promise<void> {
   });
   if (!resp.ok) {
     console.error(`down-detector: Twilio send failed — HTTP ${resp.status}: ${await resp.text()}`);
+    throw new Error(`Twilio send failed — HTTP ${resp.status}`);
   }
 }
 
@@ -178,5 +193,6 @@ async function sendWebhook(url: string, body: string): Promise<void> {
   });
   if (!resp.ok) {
     console.error(`down-detector: webhook send failed — HTTP ${resp.status}: ${await resp.text()}`);
+    throw new Error(`webhook send failed — HTTP ${resp.status}`);
   }
 }

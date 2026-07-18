@@ -220,6 +220,53 @@ describe("notifiers", () => {
     expect(smsCalls(calls)).toHaveLength(0);
   });
 
+  it("retries the DOWN alert next run when every notifier fails", async () => {
+    const kv = fakeKV();
+    // origin down AND Twilio erroring — delivery fails, state must not commit
+    const failing = stubFetch(new Set(["https://a.example", "https://api.twilio.com"]));
+    await run(env(kv)).catch(() => {});
+    await run(env(kv)).catch(() => {});
+    expect(smsCalls(failing)).toHaveLength(1);
+    // Twilio recovers; origin still down → alert retried and delivered
+    const recovered = stubFetch(new Set(["https://a.example"]));
+    await run(env(kv));
+    expect(smsCalls(recovered)).toHaveLength(1);
+    // delivered → committed → no further texts
+    await run(env(kv));
+    expect(smsCalls(recovered)).toHaveLength(1);
+  });
+
+  it("retries the UP alert next run when every notifier fails", async () => {
+    const kv = fakeKV();
+    stubFetch(new Set(["https://a.example"]));
+    await run(env(kv));
+    await run(env(kv));
+    // origin recovers but Twilio errors → UP not committed
+    const failing = stubFetch(new Set(["https://api.twilio.com"]));
+    await run(env(kv)).catch(() => {});
+    expect(smsCalls(failing)).toHaveLength(1);
+    // Twilio recovers → UP retried, then steady-state silence
+    const recovered = stubFetch();
+    await run(env(kv));
+    expect(smsCalls(recovered)).toHaveLength(1);
+    expect(smsBody(recovered[recovered.length - 1])).toContain("UP");
+    await run(env(kv));
+    expect(smsCalls(recovered)).toHaveLength(1);
+  });
+
+  it("commits state when at least one notifier delivers", async () => {
+    const kv = fakeKV();
+    // webhook erroring, Twilio fine → partial delivery counts as delivered
+    const calls = stubFetch(new Set(["https://a.example", "https://hooks.example"]));
+    const e = env(kv, { WEBHOOK_URL: "https://hooks.example/T/B/x" });
+    await run(e);
+    await run(e);
+    expect(smsCalls(calls)).toHaveLength(1);
+    // committed → still-down runs stay silent
+    await run(e);
+    expect(smsCalls(calls)).toHaveLength(1);
+  });
+
   it("fires both notifiers when both are configured", async () => {
     const kv = fakeKV();
     const calls = stubFetch(new Set(["https://a.example"]));
