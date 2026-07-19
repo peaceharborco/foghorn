@@ -1,4 +1,4 @@
-# 📟 down-detector
+# 📟 Down Detector
 
 [![CI](https://github.com/peaceharborco/down-detector/actions/workflows/ci.yml/badge.svg)](https://github.com/peaceharborco/down-detector/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)

@@ -1,6 +1,6 @@
 # Security Policy
 
-down-detector handles Twilio credentials (as Worker secrets) and sends
+Down Detector handles Twilio credentials (as Worker secrets) and sends
 outbound notifications. We appreciate responsible disclosure.
 
 ## Supported versions
