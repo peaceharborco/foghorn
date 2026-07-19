@@ -2,7 +2,7 @@
 // wrangler.jsonc is gitignored so your phone numbers and URLs stay out of git.
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "down-detector",
+  "name": "foghorn",
   "main": "src/index.ts",
   "compatibility_date": "2026-05-01",
   "observability": { "enabled": true },

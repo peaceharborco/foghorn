@@ -1,6 +1,6 @@
-# 📟 Down Detector
+# 📟 Foghorn
 
-[![CI](https://github.com/peaceharborco/down-detector/actions/workflows/ci.yml/badge.svg)](https://github.com/peaceharborco/down-detector/actions/workflows/ci.yml)
+[![CI](https://github.com/peaceharborco/foghorn/actions/workflows/ci.yml/badge.svg)](https://github.com/peaceharborco/foghorn/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 **A dead-man watchdog for your server, not another status page.** One
@@ -44,8 +44,8 @@ Two notifiers, use either or both:
 ## Quick start
 
 ```bash
-git clone https://github.com/peaceharborco/down-detector.git
-cd down-detector
+git clone https://github.com/peaceharborco/foghorn.git
+cd foghorn
 npm install
 
 # your real config stays out of git (wrangler.jsonc is gitignored)

@@ -4,7 +4,7 @@ Thanks for looking under the hood. Two things to know before you open a PR.
 
 ## The scope is the feature
 
-Down Detector stays small on purpose: one file, cron → check → one alert per
+Foghorn stays small on purpose: one file, cron → check → one alert per
 transition, zero KV writes while healthy. Bug fixes, notifier improvements,
 and reliability hardening are all welcome. Status pages, history storage,
 dashboards, and multi-region checks are not — that's

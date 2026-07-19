@@ -1,6 +1,6 @@
 # Security Policy
 
-Down Detector handles Twilio credentials (as Worker secrets) and sends
+Foghorn handles Twilio credentials (as Worker secrets) and sends
 outbound notifications. We appreciate responsible disclosure.
 
 ## Supported versions

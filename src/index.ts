@@ -1,5 +1,5 @@
 /**
- * Down Detector — Cloudflare Worker (cron-triggered)
+ * Foghorn — Cloudflare Worker (cron-triggered)
  *
  * Every minute, checks whether each configured URL is reachable from outside.
  * After FAIL_THRESHOLD consecutive failed checks it sends one alert; on
@@ -41,7 +41,7 @@ export default {
   async scheduled(_controller: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {
     const urls = parseUrls(env.CHECK_URLS ?? env.CHECK_URL ?? "");
     if (urls.length === 0) {
-      console.error("Down Detector: no CHECK_URLS configured");
+      console.error("Foghorn: no CHECK_URLS configured");
       return;
     }
     const threshold = Math.max(1, parseInt(env.FAIL_THRESHOLD ?? "2", 10) || 2);
@@ -61,7 +61,7 @@ async function checkOne(env: Env, url: string, threshold: number): Promise<void>
 
   if (ok) {
     if (prev.status === "down") {
-      await notify(env, `Down Detector: ${host} is back UP.`);
+      await notify(env, `Foghorn: ${host} is back UP.`);
       await saveState(env, url, { status: "up", fails: 0 });
     } else if (prev.fails !== 0) {
       // a partial failure streak recovered before reaching the threshold
@@ -78,7 +78,7 @@ async function checkOne(env: Env, url: string, threshold: number): Promise<void>
   }
   const fails = prev.fails + 1;
   if (fails >= threshold) {
-    await notify(env, `Down Detector: ${host} appears DOWN — ${fails} consecutive failed checks.`);
+    await notify(env, `Foghorn: ${host} appears DOWN — ${fails} consecutive failed checks.`);
     await saveState(env, url, { status: "down", fails });
   } else {
     await saveState(env, url, { status: "up", fails });
@@ -152,12 +152,12 @@ async function notify(env: Env, body: string): Promise<void> {
     tasks.push(sendWebhook(env.WEBHOOK_URL, body));
   }
   if (tasks.length === 0) {
-    console.error(`Down Detector: no notifier configured — dropped alert: ${body}`);
+    console.error(`Foghorn: no notifier configured — dropped alert: ${body}`);
     return;
   }
   const results = await Promise.allSettled(tasks);
   if (results.every((r) => r.status === "rejected")) {
-    throw new Error(`Down Detector: every notifier failed — alert will retry next run: ${body}`);
+    throw new Error(`Foghorn: every notifier failed — alert will retry next run: ${body}`);
   }
 }
 
@@ -178,7 +178,7 @@ async function sendSms(env: Env, body: string): Promise<void> {
     body: form.toString(),
   });
   if (!resp.ok) {
-    console.error(`Down Detector: Twilio send failed — HTTP ${resp.status}: ${await resp.text()}`);
+    console.error(`Foghorn: Twilio send failed — HTTP ${resp.status}: ${await resp.text()}`);
     throw new Error(`Twilio send failed — HTTP ${resp.status}`);
   }
 }
@@ -192,7 +192,7 @@ async function sendWebhook(url: string, body: string): Promise<void> {
     body: JSON.stringify({ text: body, content: body }),
   });
   if (!resp.ok) {
-    console.error(`Down Detector: webhook send failed — HTTP ${resp.status}: ${await resp.text()}`);
+    console.error(`Foghorn: webhook send failed — HTTP ${resp.status}: ${await resp.text()}`);
     throw new Error(`webhook send failed — HTTP ${resp.status}`);
   }
 }

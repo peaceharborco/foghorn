@@ -1,5 +1,5 @@
 {
-  "name": "down-detector",
+  "name": "foghorn",
   "version": "1.0.0",
   "private": true,
   "description": "The smallest possible dead-man watchdog: a cron-triggered Cloudflare Worker that texts you when your server goes down. One file, no dashboard, free tier forever.",
