@@ -30,3 +30,8 @@ you in the release notes unless you'd rather stay anonymous.
   (`wrangler secret put`), never in `vars`.
 - A Slack/Discord webhook URL is itself a credential — anyone holding it can
   post to your channel. Treat `WEBHOOK_URL` accordingly.
+- `HEARTBEAT_URL` is a capability URL: the token *is* the URL, and anyone
+  holding it can forge a heartbeat and keep the alarm-on-the-alarm quiet while
+  foghorn is dead. It belongs in a Worker secret, never in `vars`, and foghorn
+  logs only an error's `name` — never the error itself — so a failed ping
+  cannot spill it into observability logs.

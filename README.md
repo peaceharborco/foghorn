@@ -26,7 +26,9 @@ State lives in Workers KV and is written **only when something changes**. A
 healthy server does *zero* KV writes — which matters, because Cloudflare's free
 tier allows 1,000 KV writes/day and a naive write-every-minute monitor burns
 1,440. This one idles at 1,440 *reads*/day per URL against a 100,000/day read
-quota. It runs free, forever, and never gets close to the limits.
+quota. It runs free, forever, and never gets close to the limits. (Turning on
+`SYNTHETIC_TEST_DAYS` adds one read per run and one write per interval — a
+dozen writes a year.)
 
 And because it's a dead-man alarm, delivery is part of the state machine: if
 every configured notifier fails to send (Twilio rejects, webhook 500s), the
@@ -60,12 +62,15 @@ npx wrangler kv namespace create STATE
 npx wrangler secret put TWILIO_ACCOUNT_SID
 npx wrangler secret put TWILIO_AUTH_TOKEN
 
+# strongly recommended — the dead-man ping that catches foghorn's own death
+npx wrangler secret put HEARTBEAT_URL
+
 npx wrangler deploy
 ```
 
-That's it. No servers to host, no containers, nothing watching the watcher —
-the monitor lives on Cloudflare's edge, outside the blast radius of the thing
-it's monitoring.
+That's it. No servers to host, no containers — the monitor lives on
+Cloudflare's edge, outside the blast radius of the thing it's monitoring, and
+`HEARTBEAT_URL` puts one more pair of eyes outside *that*.
 
 ## Configuration
 
@@ -77,10 +82,57 @@ All plain vars in `wrangler.jsonc` (secrets via `wrangler secret put`):
 | `FAIL_THRESHOLD` | no | Consecutive failed checks before a DOWN alert. Default `2` — with a 1-minute cron, that's ~2 minutes of confirmed downtime before your phone buzzes. |
 | `TWILIO_FROM` / `TWILIO_TO` | for SMS | Your Twilio number and where to text. Also needs the `TWILIO_ACCOUNT_SID` and `TWILIO_AUTH_TOKEN` secrets. |
 | `WEBHOOK_URL` | for webhook | Any Slack/Discord-compatible webhook endpoint. |
+| `HEARTBEAT_URL` | no (**secret**) | Dead-man ping URL from healthchecks.io or equivalent, pinged on each run that foghorn could actually page you (see below). This is what raises the alarm when *foghorn itself* dies. A capability URL — use `wrangler secret put`, not a var. |
+| `SYNTHETIC_TEST_DAYS` | no | Text yourself every N **whole** days to prove the delivery path still works. Off unless set; enabling it sends one on the next cron. Costs one text per interval. |
 
 A check counts as **up** on any 2xx/3xx response. A 4xx, a 5xx, a timeout
 (10s), or a refused connection all count as **down** — if your homepage starts
-throwing 500s, that's an outage, whatever the TCP handshake thinks.
+throwing 500s, that's an outage, whatever the TCP handshake thinks. The alert
+says which kind of dead it is: *unreachable* when nothing answered, *answered
+HTTP 403* when the origin is up but refusing (a WAF rule, a challenge, or a
+check URL that's simply wrong).
+
+### Who watches the watchman
+
+A dead-man alarm whose own death is silent isn't one. If the cron stops firing,
+a deploy throws, or the account is suspended, foghorn goes quiet — which looks
+exactly like a healthy server.
+
+`HEARTBEAT_URL` closes that: each run pings a service outside Cloudflare, which
+raises the alarm when the pings *stop*. It fires on DOWN runs too, deliberately
+— gating it on the origin being up would mean a real outage silences the
+heartbeat, and you'd get "foghorn is dead" alongside a correct DOWN alert, one
+of them lying.
+
+It goes quiet in exactly the cases where foghorn could not page you anyway:
+
+- something other than a refused alert threw — a dead KV binding, a write
+  quota exhausted, state that won't commit;
+- no notifier is configured at all, so every alert is being dropped to a log;
+- `CHECK_URLS` is empty, so foghorn is watching nothing.
+
+An alert merely failing to send is *not* on that list, and neither is a failed
+delivery test. Both happen while foghorn is alive and doing its job, and
+withholding the ping for either produces a false "foghorn is dead" page on top
+of a correct DOWN alert — two alarms, one of them lying.
+
+All of which proves foghorn *ran*. It proves nothing about whether Twilio would
+*deliver* — a rotated auth token leaves foghorn looking healthy right up until
+the outage it fails to report. `SYNTHETIC_TEST_DAYS` is the answer: a periodic
+text, plainly worded so it's never mistaken for an outage, and never sent while
+a URL is down (a real DOWN alert proves the same thing, and SMS arrival order
+isn't guaranteed).
+
+A failed delivery test retries hourly until it lands, so one transient blip
+can't hide notifier rot for a month. Two limits worth knowing, both recorded in
+the source: **a failure is loud in the logs but pages nobody** — wiring it to
+the heartbeat deadlocks, and the real answer is your dead-man provider's own
+failure endpoint — and **with several notifiers configured it proves at least
+one path works, not all of them**, so a rotated Twilio token can hide behind a
+working Slack webhook.
+
+Pick a provider whose delivery path differs from your notifier's, or one Twilio
+outage takes both alarms down at once.
 
 ## What this deliberately is not
 

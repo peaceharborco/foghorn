@@ -2,10 +2,19 @@
 // wrangler.jsonc is gitignored so your phone numbers and URLs stay out of git.
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "foghorn",
+  // The deployed Worker is "down-detector" — foghorn's original name, kept
+  // because renaming a Worker means deploying a new one and deleting the old.
+  // Change this only if you intend to run a DIFFERENT Worker: deploying under
+  // a new name creates a second one, and the first keeps running its own cron.
+  "name": "down-detector",
   "main": "src/index.ts",
   "compatibility_date": "2026-05-01",
   "observability": { "enabled": true },
+  // No public surface. A cron-only Worker has no fetch handler, so the
+  // *.workers.dev URL serves nothing — but requests to it still burn Worker
+  // invocations, and exceeding the free tier's 100,000/day cap stops the cron
+  // entirely. Leave this false unless you add an HTTP handler on purpose.
+  "workers_dev": false,
   "triggers": {
     // every minute — cron's finest granularity
     "crons": ["* * * * *"]
@@ -28,6 +37,14 @@
     // both "text" and "content" keys, so a Slack or Discord webhook URL works
     // here as-is. Remove if unused.
     "WEBHOOK_URL": "https://hooks.slack.com/services/XXX/YYY/ZZZ"
+
+    // --- Watching the watchman (both optional) ---
+
+    // Text yourself every N whole days to prove the delivery path still works.
+    // The heartbeat below proves foghorn RAN; only this proves Twilio would
+    // DELIVER. Left commented out on purpose: it sends a real text on the very
+    // next cron, so turning it on is your call, not the template's.
+    //   "SYNTHETIC_TEST_DAYS": "30"
   },
   "kv_namespaces": [
     // id is filled in after `wrangler kv namespace create STATE`
@@ -36,4 +53,10 @@
   // Twilio secrets (only if using SMS):
   //   wrangler secret put TWILIO_ACCOUNT_SID
   //   wrangler secret put TWILIO_AUTH_TOKEN
+  //
+  // Dead-man ping URL from healthchecks.io or equivalent, hit once per run.
+  // This is what pages when FOGHORN itself dies. It is a capability URL —
+  // anyone holding it can forge a heartbeat — so it goes in a secret, never
+  // in "vars" above:
+  //   wrangler secret put HEARTBEAT_URL
 }

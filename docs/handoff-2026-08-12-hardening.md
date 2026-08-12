@@ -1,9 +1,8 @@
-# Handoff — foghorn hardening, designed and reviewed, nothing built (2026-08-12)
+# Handoff — foghorn hardening, steps 1–4 shipped (2026-08-12)
 
-**Repo:** `foghorn` · **Branch:** `main` · **Tree:** clean at `286d918` · **Worker unchanged.**
-**Status:** design only. `src/index.ts` is byte-identical to what has been running
-for weeks, still watching one URL. No code written, nothing deployed. The
-**deployed Worker is not affected by anything in this handoff.**
+**Repo:** `foghorn` · **Worker:** `down-detector`, version `26049c67`, **DEPLOYED**.
+**Status:** steps 1–4 of the sequencing below are built, reviewed across three
+gate rounds, and live. Steps 5–8 are untouched. 49 tests, typecheck clean.
 
 **Artifacts:** `docs/specs/2026-08-12-hardening-design.md` (rev 2) and its review,
 `…-hardening-design-review-grok.md`. Rev 2 is the one to read; rev 1 was wrong in
@@ -12,9 +11,55 @@ several places and rev 2 says where.
 | | |
 |---|---|
 | **What foghorn is** | A dead-man alarm: cron Worker, one file, texts the operator when cds1 stops answering. Not a status page — the README declines that on purpose. |
-| **Biggest gap found** | Nothing *pages* when foghorn itself dies. §2.1. |
+| **Biggest gap found** | Nothing *pages* when foghorn itself dies. §2.1 — now closed by `HEARTBEAT_URL`. |
 | **Biggest correction** | Three of rev 1's claims about the `swatter` repo were wrong. §5. |
-| **Ready to build** | Steps 1–2 (user agent, alert wording). Everything after needs an experiment or a decision. |
+| **Next to build** | Step 5, the origin-probe experiment. It gates step 6. |
+
+## What shipped, and what it cost to get right
+
+Steps 1–4: probe `User-Agent`, DOWN-alert wording, outbound heartbeat, and a
+periodic delivery test. Verified live — foghorn now appears in cds1's
+`access_log` as `Foghorn/1.0` (it was UA `"-"` until 23:38:25 UTC).
+
+Also closed spec §2.5's worry: **`workers_dev: false`** (version `3afedd8f`).
+The `*.workers.dev` URL served nothing — foghorn is cron-only with no `fetch`
+handler — but requests to it still burned invocations, and exceeding the free
+tier's 100,000/day stops the cron, which is the silent death the heartbeat
+exists to catch. Now `HTTP 404`. Note this lives in `wrangler.jsonc`, which is
+**gitignored**, so the deployed config is not in version control; the setting is
+mirrored in `wrangler.jsonc.example` so it survives a fresh setup.
+
+**Three `/grok` rounds, and the first two both returned HOLD.** Worth knowing
+what they caught, because two of the three Blockers were introduced by the
+fixes rather than by the original code:
+
+1. The delivery test **stamped KV before sending**, so a rotated Twilio token
+   produced one log line and thirty days of green heartbeats. Now success and
+   attempts are recorded separately, retrying hourly.
+2. A gap-fix **enabled `SYNTHETIC_TEST_DAYS` in the tracked example**, which
+   would have texted anyone following the quick start — and silently answered
+   §7's open question 4, which belongs to the operator.
+3. Wiring a failed delivery test to **withhold the heartbeat deadlocked**: the
+   test is skipped while a URL is down, so nothing could clear the flag and the
+   dead-man service would page "foghorn is dead" for a whole outage while
+   foghorn was correctly firing DOWN. **Reverted, with a regression test.**
+   `src/index.ts` says so at the `Synthetic` interface and at the call site —
+   do not re-couple them.
+
+## Live-but-dormant bug: fix before enabling `SYNTHETIC_TEST_DAYS`
+
+Round 3 M3. In `runSyntheticTest`, if `notify()` succeeds and the KV write then
+throws, the outer `catch` logs a false `FAILED`; if the retry write also fails,
+`attempt` never lands and the hourly brake never engages — a reviewer measured
+five texts in five runs. Harmless while the var is unset, which is why it
+shipped. **Split the success-write failure from a failed send before turning
+that flag on.**
+
+## Also open
+
+- **A failed delivery test pages nobody** — it logs and retries. The fix is
+  healthchecks.io's `/fail` endpoint, ideally against a second dedicated check
+  so it does not flap the liveness one.
 
 ---
 
