@@ -24,7 +24,7 @@ several places and rev 2 says where.
 | **Biggest gap found** | Nothing *pages* when foghorn itself dies. §2.1 — now closed by `HEARTBEAT_URL`. |
 | **Biggest correction** | Three of rev 1's claims about the `swatter` repo were wrong. §5. |
 | **Next to build** | Nothing required. Step 5 was run and CANCELLED itself (spec §0.5); step 6 is deferred behind a trigger. healthchecks.io `/fail` **is now wired** — `DELIVERY_PING_URL` is set on the live Worker. Remaining: step 8 in the *swatter* repo. |
-| **Highest-value item left** | Not in this spec at all: point `CHECK_URLS` at a health endpoint that touches PHP and the database. Today "up" means Apache answered a 163-byte cPanel default page. |
+| **Scope, settled** | Foghorn watches **the server**, not the sites. Jetpack covers individual sites; NetData and Swatter cover the box. Two long-standing "open" items were closed on that basis — see "Closed" below and §4. |
 | **Trap for the next machine** | `wrangler.jsonc` is gitignored, so it drifts per-machine and git cannot see it. It had silently drifted on the iMac. §8. |
 
 ## What shipped, and what it cost to get right
@@ -94,17 +94,31 @@ received, so the Twilio path is proven end to end — the one thing the heartbea
 can never tell you. Production runs Twilio only, so the "several notifiers means
 it only proves ONE path" caveat does not currently bite.
 
-## Also open
+## Closed 2026-08-13 — the two items that used to live here
 
-- **Content assertion is per-deployment, not per URL.** Spec §2.6 asked for per
-  URL; it applies to every entry in `CHECK_URLS`. Going inert on more than one
-  was tried and reverted — it meant adding a URL silently killed the assertion
-  protecting the original, and §1 puts a quiet miss below a loud false page.
-  Make it per URL before watching several URLs with it on.
-- **The checked URL is a 163-byte cPanel default page**, so "up" means "Apache
-  answered", not "the sites work". Pointing `CHECK_URLS` at a health endpoint
-  that touches PHP and the database would be a bigger win than anything left
-  in this spec — and would give the content assertion something worth asserting.
+Both were carried in this doc for a while as "the highest-value work left".
+**Neither is going to be built**, and the reasoning matters more than the
+verdict, so it is recorded in §4 as a decision rather than deleted. Short
+version:
+
+- ~~**Point `CHECK_URLS` at a health endpoint that touches PHP and the
+  database.**~~ **WON'T DO.** It was drifting toward the status-page role the
+  README and §4 both refuse. The real gap it named is real — nothing pages when
+  MariaDB dies — but it belongs to NetData, which already watches that server.
+  §9 has the evidence.
+- ~~**Make the content assertion per-URL.**~~ **WON'T DO — it existed only to
+  serve the item above.** Per-URL assertion is what would let foghorn watch a
+  placeholder and a health endpoint at once without one falsely paging on the
+  other. With one server-level URL watched forever, that case never arrives.
+  The current per-deployment behavior is already the safe default, and
+  `EXPECT_TEXT`/`FORBID_TEXT` are unset in production anyway.
+
+**If either is ever revived, revive them together** — the second is plumbing
+for the first and is pointless alone.
+
+Still true, and still the reason someone will keep proposing this: **the checked
+URL is a 163-byte cPanel default page**, so "up" means "Apache answered", not
+"the sites work". That is now a deliberate property, not a shortfall. See §4.
 
 ---
 
@@ -151,7 +165,8 @@ Kept below as the record of what was intended and why.
 7. ~~**Content assertion**~~, opt-in, default off, and only for
    200-with-error-body. **SHIPPED** (`71928f4`) as `EXPECT_TEXT` /
    `FORBID_TEXT` — out of order, ahead of 5 and 6. Unset in production; see §8.
-   Still per-deployment rather than per-URL — see "Also open" above.
+   Still per-deployment rather than per-URL, and **staying that way** — making
+   it per-URL was closed as won't-do on 2026-08-13; see "Closed" above and §4.
 8. **Swatter-side cross-check** (nightly "did foghorn probe me?"). Work in the
    *swatter* repo, listed here so it is not lost. **The only step still open.**
 
@@ -194,6 +209,22 @@ not the dashboard, not from this repo.
 - **The content assertion is not the anti-cache fix.** A stale-but-healthy cached
   page passes any content check. It earns its place only for a 200 carrying an
   error body.
+- **Foghorn watches the SERVER, not the sites — settled by the owner
+  2026-08-13.** Individual sites are Jetpack's job; it already pings them and
+  notifies per site. Foghorn works *in tandem with* Swatter, NetData and
+  Jetpack rather than duplicating any of them. This is the rule the two items
+  closed above ran into, and it is the general form of the older "no customer
+  vhosts" decision: **the 163-byte placeholder is not a shortfall, it is the
+  right target.** It is the cheapest possible proof that the box is up and
+  Apache is answering, and it cannot break for any reason specific to a site.
+  A richer check buys coverage that other tools already own, and pays for it in
+  false 3am pages — which §1 ranks as the worse failure.
+- **"Nothing pages when MariaDB dies" is NOT foghorn's to fix.** The gap is
+  real (§9 has the evidence) but the fix belongs in NetData, which already
+  watches that server and can cover *every* systemd service in one change
+  instead of just the database. Building it here would have meant a PHP
+  endpoint on prod, a new DNS record, and a new public surface, to do a worse
+  version of a job another tool already has.
 
 ## 5. Corrections that propagated OUT of this repo
 
@@ -330,3 +361,50 @@ here, 12 seconds apart.
 - `.gitignore` matches `wrangler.jsonc` **exactly**, not `wrangler.jsonc.*`. A
   file like `wrangler.jsonc.bak` is therefore untracked-but-visible in a public
   repo, carrying real phone numbers. Do not leave backups next to it.
+
+---
+
+## 9. Why the health-endpoint idea died: what NetData does and does not cover
+
+Measured on cds1, 2026-08-13, read-only. This section exists so the idea is not
+revived from first principles a third time.
+
+**NetData is running and enabled**, with 196 alarm instances across 63 alarm
+types. They are almost entirely **host-level**: CPU, RAM, load, disk space and
+inodes, network, TCP, OOM kill, reboot detection.
+
+**Database coverage is absent.** The mysql collector runs and `mysql.*` charts
+exist, but:
+
+- there is **no MariaDB health alarm of any kind**; and
+- unlike `phpfpm`, `exim`, `chrony`, `memcached` and apache's `web_log`, the
+  mysql collector has **no `data_collection_status` alarm** — so when it loses
+  its connection to a dead database, nothing fires.
+
+The only mariadb-adjacent alarm is `mariadbd_fds_open_limit`, which is
+file-descriptor *utilization*. A dead `mariadbd` has no file descriptors to
+exceed a threshold: it goes quiet, not critical.
+
+**The near-miss.** A stock `systemd_service_unit_failed_state` template exists,
+the `systemd.service_unit_state` chart exists, and MariaDB *is* tracked
+(`systemd_mariadb.cpu`). That would have covered this — but **the alarm is
+never instantiated**; it appears nowhere in the active list. The fact is
+confirmed; the reason was not determined. And even instantiated it would not
+have texted: the template is **`warn`-only** (no `crit:` line) while the Twilio
+recipient is scoped `+12089209073|critical`, so warnings never reach SMS.
+
+### The shared-Twilio finding — matters to this repo
+
+**NetData and foghorn send through the same Twilio path**: same account
+(`ACe061…`), same `TWILIO_NUMBER` / `TWILIO_FROM` (`+12084189224`), same
+recipient (`+12089209073`).
+
+- **Risk:** one rotated auth token silences **both** alarms at once. Two
+  monitors that look independent share one throat to choke. Anyone rotating
+  that token must update the Worker secret *and* `health_alarm_notify.conf`.
+- **Benefit, unplanned:** foghorn's 30-day synthetic delivery test is therefore
+  proving NetData's SMS path too. Neither system knows this. It is also an
+  argument for **keeping** `SYNTHETIC_TEST_DAYS` on.
+
+Configuration was verified, **delivery was not** — firing a test alarm sends a
+real text, so it was not done.
