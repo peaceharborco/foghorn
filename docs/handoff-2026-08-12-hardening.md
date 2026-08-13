@@ -1,6 +1,6 @@
 # Handoff — foghorn hardening, steps 1–4 shipped (2026-08-12)
 
-**Repo:** `foghorn` · **Worker:** `down-detector`, version `f48a4ec1`, **DEPLOYED**.
+**Repo:** `foghorn` · **Worker:** `down-detector`, version `e2f54d2c`, **DEPLOYED**.
 **Status:** steps 1–4 of the sequencing below are built, reviewed across five
 gate rounds, and live. Steps 5–8 are untouched. 53 tests, typecheck clean.
 
