@@ -1,8 +1,8 @@
 # Handoff — foghorn hardening, steps 1–4 shipped (2026-08-12)
 
-**Repo:** `foghorn` · **Worker:** `down-detector`, version `26049c67`, **DEPLOYED**.
-**Status:** steps 1–4 of the sequencing below are built, reviewed across three
-gate rounds, and live. Steps 5–8 are untouched. 49 tests, typecheck clean.
+**Repo:** `foghorn` · **Worker:** `down-detector`, version `39ae04a7`, **DEPLOYED**.
+**Status:** steps 1–4 of the sequencing below are built, reviewed across five
+gate rounds, and live. Steps 5–8 are untouched. 53 tests, typecheck clean.
 
 **Artifacts:** `docs/specs/2026-08-12-hardening-design.md` (rev 2) and its review,
 `…-hardening-design-review-grok.md`. Rev 2 is the one to read; rev 1 was wrong in
@@ -29,9 +29,9 @@ exists to catch. Now `HTTP 404`. Note this lives in `wrangler.jsonc`, which is
 **gitignored**, so the deployed config is not in version control; the setting is
 mirrored in `wrangler.jsonc.example` so it survives a fresh setup.
 
-**Three `/grok` rounds, and the first two both returned HOLD.** Worth knowing
-what they caught, because two of the three Blockers were introduced by the
-fixes rather than by the original code:
+**Five `/grok` rounds; 1, 2 and 4 returned HOLD.** Worth knowing what they
+caught, because every Blocker after the first was introduced by the fix to a
+previous finding:
 
 1. The delivery test **stamped KV before sending**, so a rotated Twilio token
    produced one log line and thirty days of green heartbeats. Now success and
@@ -46,14 +46,39 @@ fixes rather than by the original code:
    `src/index.ts` says so at the `Synthetic` interface and at the call site —
    do not re-couple them.
 
-## Live-but-dormant bug: fix before enabling `SYNTHETIC_TEST_DAYS`
+## Rounds 3–5: the delivery test, fixed twice more
 
-Round 3 M3. In `runSyntheticTest`, if `notify()` succeeds and the KV write then
-throws, the outer `catch` logs a false `FAILED`; if the retry write also fails,
-`attempt` never lands and the hourly brake never engages — a reviewer measured
-five texts in five runs. Harmless while the var is unset, which is why it
-shipped. **Split the success-write failure from a failed send before turning
-that flag on.**
+`runSyntheticTest` used to send and then record. If `notify()` succeeded and the
+KV write threw, the outer `catch` logged a false `FAILED`; if the retry write
+also failed, `attempt` never landed and every run looked due — a reviewer
+measured five texts in five runs, which is what an exhausted write quota would
+have produced.
+
+It now records the **attempt first and sends nothing if that write fails**, then
+sends, then records success separately. Only `ok` waits for proven delivery, so
+a failed send still costs the interval nothing.
+
+**That fix then introduced round 4's Blocker, caught by both models.** It wrote
+the same key twice in one invocation, and **Workers KV allows 1 write per key
+per second, throwing 429 beyond it** — a Twilio round trip is well under a
+second. On the *happy* path the success write would 429, `ok` would never
+advance, and the hourly brake would resend forever: ~24 texts a day once the
+flag was on. Fifty-one passing tests could not see it, because `fakeKV` does not
+rate limit.
+
+Now split across **two keys** — `synthetic:ok` and `synthetic:attempt`, bare
+timestamps — each written at most once per invocation. Two writes per interval
+(~24 a year). Pinned by tests that assert no key is written twice in a run, and
+that a rate-limiting KV still lets `ok` advance.
+
+`attempt > ok` means **"retry slowly"**, not "delivery is known broken": the two
+keys are read independently and KV serves stale values for up to ~60s, so a
+healthy path can read as broken for a while. Every torn state was enumerated in
+round 5 — worst case is a surplus text or a delayed re-proof, never a missed
+origin page.
+
+**`SYNTHETIC_TEST_DAYS` is still off** — that is §7 question 4, and it is the
+operator's call, not a blocked task.
 
 ## Also open
 
@@ -73,7 +98,11 @@ each under a correctness and a safety lens) then took rev 1 apart.
 Nothing here is urgent. Foghorn works. This is about the ways it could be lying to
 you without either of you noticing.
 
-## 2. What rev 2 actually proposes, in build order
+## 2. What rev 2 proposes, in build order — steps 1–4 are DONE
+
+**Steps 1–4 below are built, gated and deployed.** They are kept here as the
+record of what was intended and why; read them as history, not as a task list.
+Step 5 is where work resumes.
 
 1. **Set a User-Agent.** One line. Workers `fetch` sends none, confirmed by live
    evidence — foghorn's own probe appears in cds1's `access_log` with UA `"-"`.
@@ -156,13 +185,12 @@ gate D should use the corrected reasoning.
 
 ## 6. Gotchas for whoever builds this
 
-- **The test suite is small and stubs coarsely.** `test/index.test.ts:31-41` stubs
-  `fetch` as *200 unless the URL prefix is in a `down` set*, and never asserts
-  response headers. So: the UA change is testable today by reading `init.headers`;
-  a `CF-Cache-Status` check that failed on a missing header would break **every
-  existing test** (one more reason it must fail open); and the heartbeat needs a
-  new assertion that a **DOWN** run still pings. `fakeKV` already counts writes, so
-  write-budget assertions are cheap.
+- **The test suite is no longer small — 16 tests became 53** — but it still
+  stubs `fetch` coarsely. `stubFetch` now takes a failure mode (an HTTP status,
+  or `"throw"` for the no-response case) and `atTime` pins `Date.now()`. Still
+  true and still relevant to step 6: **no test asserts response headers**, so a
+  `CF-Cache-Status` check that failed on a missing header would break nearly
+  every test — one more reason it must fail open.
 - **KV write budget is the constraint, not reads.** 1,000 writes/day free. State is
   written only on transitions and sub-threshold streaks — do not add a field that
   makes every run write.
@@ -170,17 +198,31 @@ gate D should use the corrected reasoning.
   only when *every* notifier fails, so the state write is skipped and the alert
   retries next minute. A heartbeat that can throw would become a second, accidental
   way to skip that write.
+  *Amended:* one change was made — it throws a `NotifyError` subclass instead of
+  a plain `Error`, so the heartbeat can tell "the alert did not get out" from
+  "foghorn is broken". Reviewers confirmed the retry invariant survives. The
+  `tasks.length === 0` path still logs and returns without throwing, which is
+  why the heartbeat separately requires `hasNotifier(env)` — otherwise an
+  unconfigured foghorn drops every alert while reporting healthy.
 - **Deploy is `wrangler deploy` from this repo and is operator-run.** Cloudflare
   *zone* changes still go through `terminal-scripts`; deploying a Worker is not a
   zone change, but a DNS record for the grey-cloud hostname is.
 - **`/grok` gates this**, per swatter's `CLAUDE.md` and the developer-wide rule:
-  review the design before implementing (done — that is rev 2) and the diff before
-  deploying (not done, nothing exists yet).
+  review the design before implementing (done — that is rev 2) and the diff
+  before deploying (done — **five rounds**; 1, 2 and 4 returned HOLD, 3 and 5
+  SHIP). Budget for that on steps 5–8: every HOLD after the first was a Blocker
+  *introduced by the fix to a previous finding*, so one round is never enough.
+  Round 4's was a misread of a documented platform limit that 51 passing tests
+  could not see, because `fakeKV` does not enforce what Cloudflare does — it
+  has no rate limiting, no eventual consistency, no size caps. Tests validate
+  the model of the platform, not the platform.
 
 ## 7. Open questions needing a human
 
-1. **Which heartbeat provider**, and does it deliver over a path that differs from
-   Twilio? If it also texts via Twilio, one Twilio outage takes both alarms down.
+1. ~~**Which heartbeat provider**~~ — **ANSWERED 2026-08-12: healthchecks.io**,
+   free tier, alerting by email and push with SMS off, so the alarm-on-the-alarm
+   shares no delivery path with Twilio. Live and pinging. Its ping URL is a
+   capability — a plain GET *is* a heartbeat — and is stored as a Worker secret.
 2. **Is the grey-cloud hostname acceptable?** It publishes the origin IP in DNS.
    That is already inferable, and origin-lock is the actual defence, but it is a
    deliberate exposure and belongs to the operator, not to me.

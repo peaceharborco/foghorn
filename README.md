@@ -27,8 +27,8 @@ healthy server does *zero* KV writes — which matters, because Cloudflare's fre
 tier allows 1,000 KV writes/day and a naive write-every-minute monitor burns
 1,440. This one idles at 1,440 *reads*/day per URL against a 100,000/day read
 quota. It runs free, forever, and never gets close to the limits. (Turning on
-`SYNTHETIC_TEST_DAYS` adds one read per run and one write per interval — a
-dozen writes a year.)
+`SYNTHETIC_TEST_DAYS` adds two reads per run and two writes per interval — a
+couple of dozen writes a year.)
 
 And because it's a dead-man alarm, delivery is part of the state machine: if
 every configured notifier fails to send (Twilio rejects, webhook 500s), the

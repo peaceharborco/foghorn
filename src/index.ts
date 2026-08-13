@@ -62,8 +62,11 @@ interface Probe {
 
 /**
  * Delivery-test bookkeeping. `ok` is the last PROVEN delivery, `attempt` the
- * last try. `attempt > ok` means the path is known broken, which only slows
- * retries to hourly.
+ * last try. `attempt > ok` means "retry slowly" — NOT "delivery is known
+ * broken". The two keys are read independently and KV serves stale or missing
+ * values for up to ~60s (negative lookups are cached too), so a healthy path
+ * can read as `attempt > ok` for a while. It only ever costs a delayed
+ * re-proof or a surplus text, never a missed origin page.
  *
  * It deliberately does NOT gate the heartbeat, however tempting that looks:
  * the test is skipped whenever a URL is down, so withholding the ping on
@@ -86,7 +89,13 @@ const DAY_MS = 86_400_000;
 // is Twilio spam and a KV write storm), not a full interval (that would let
 // one transient blip hide notifier rot until the next outage).
 const SYNTHETIC_RETRY_MS = 3_600_000;
-const SYNTHETIC_KEY = "synthetic:last";
+// Two keys, not one record. Workers KV allows 1 write per key per second and
+// throws 429 beyond it, and a delivery test writes twice in one invocation —
+// once before sending, once after. Split across keys, each is written at most
+// once per run. (A pre-release build used a single `synthetic:last` JSON blob;
+// it was never enabled in production, so there is nothing to migrate.)
+const SYNTHETIC_OK_KEY = "synthetic:ok";
+const SYNTHETIC_ATTEMPT_KEY = "synthetic:attempt";
 // Alert bodies must stay inside one 160-character GSM-7 segment; clamping the
 // host is what keeps that true for a name longer than the current one.
 const MAX_HOST_IN_SMS = 40;
@@ -347,11 +356,15 @@ function syntheticDays(env: Env): number | null {
 
 async function loadSynthetic(env: Env): Promise<Synthetic> {
   try {
-    const raw = await env.STATE.get(SYNTHETIC_KEY);
-    if (raw === null) return { ok: 0, attempt: 0 };
-    const parsed = JSON.parse(raw) as Partial<Synthetic>;
-    const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : 0);
-    return { ok: num(parsed.ok), attempt: num(parsed.attempt) };
+    const [okRaw, attemptRaw] = await Promise.all([
+      env.STATE.get(SYNTHETIC_OK_KEY),
+      env.STATE.get(SYNTHETIC_ATTEMPT_KEY),
+    ]);
+    const num = (v: string | null) => {
+      const n = v === null ? 0 : Number(v);
+      return Number.isFinite(n) && n >= 0 ? n : 0;
+    };
+    return { ok: num(okRaw), attempt: num(attemptRaw) };
   } catch {
     return { ok: 0, attempt: 0 };
   }
@@ -392,20 +405,40 @@ async function runSyntheticTest(
   if (now - ok < days * DAY_MS) return;
   if (attempt > ok && now - attempt < SYNTHETIC_RETRY_MS) return;
 
+  // Record the ATTEMPT before sending, and send nothing if that write fails.
+  // An unrecorded attempt looks due again the next minute, which is a text a
+  // minute for as long as KV writes are failing — and an exhausted write quota
+  // is exactly when that happens. Only `ok` waits for proven delivery, so a
+  // failed send still costs the interval nothing.
+  try {
+    await env.STATE.put(SYNTHETIC_ATTEMPT_KEY, String(now));
+  } catch (err) {
+    console.error(
+      `Foghorn: skipping the delivery test — cannot record the attempt (${errName(err)}).`,
+    );
+    return;
+  }
+
   try {
     await notify(env, SYNTHETIC_MESSAGE);
-    await env.STATE.put(SYNTHETIC_KEY, JSON.stringify({ ok: now, attempt: now }));
   } catch (err) {
-    try {
-      await env.STATE.put(SYNTHETIC_KEY, JSON.stringify({ ok, attempt: now }));
-    } catch {
-      // KV is unavailable too. Nothing else to record it with; the run's own
-      // state writes will be failing for the same reason and those DO withhold
-      // the ping.
-    }
     console.error(
       `Foghorn: SYNTHETIC DELIVERY TEST FAILED (${errName(err)}) — ` +
         `alerts may not be reaching anyone. Retrying hourly until it lands.`,
+    );
+    return;
+  }
+
+  try {
+    await env.STATE.put(SYNTHETIC_OK_KEY, String(now));
+  } catch (err) {
+    // Delivered, but the success could not be recorded, so `attempt > ok`
+    // stands and this retries hourly rather than every minute. One surplus
+    // text an hour at worst. Using a separate key avoids the per-key 1-write-
+    // per-second cap, but NOT the 1,000 writes/day account limit — exhaust
+    // that and every key fails, including the origin's own state writes.
+    console.error(
+      `Foghorn: delivery test succeeded but recording it failed (${errName(err)}).`,
     );
   }
 }

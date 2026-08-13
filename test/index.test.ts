@@ -394,16 +394,20 @@ describe("synthetic delivery test", () => {
     expect(synthetic(calls)).toHaveLength(2);
   });
 
-  it("costs one KV write per interval, not one per run", async () => {
+  it("costs two KV writes per interval, not one per run", async () => {
+    // Two: the attempt stamp before sending, then the success stamp after.
+    // That ordering is what stops a text a minute when writes are failing.
+    // Two per 30 days is ~24 a year against a 1,000/day cap; a write per run
+    // would be 1,440/day and would take the whole state machine down with it.
     const kv = fakeKV();
     stubFetch();
     atTime(T0);
     await run(env(kv, enabled));
-    expect(kv.writes).toBe(1);
+    expect(kv.writes).toBe(2);
     atTime(T0 + 60_000);
     await run(env(kv, enabled));
     await run(env(kv, enabled));
-    expect(kv.writes).toBe(1);
+    expect(kv.writes).toBe(2);
   });
 
   it("does not retry every minute when the test send fails", async () => {
@@ -574,6 +578,91 @@ describe("delivery-path failure is not silent", () => {
     await run(env(kv, live));
     expect(smsCalls(outage).some((c) => smsBody(c).includes("DOWN"))).toBe(true);
     expect(pings(outage)).toHaveLength(2);
+  });
+
+  it("does not text at all when it cannot record the attempt", async () => {
+    // If the stamp cannot be written, sending would repeat every single minute
+    // for as long as KV is unwell. Better to send nothing than to spam.
+    const kv = fakeKV();
+    const noWrites = {
+      writes: 0,
+      get: (k: string) => kv.get(k),
+      put: async () => {
+        throw new TypeError("KV write quota exceeded");
+      },
+    } as unknown as FakeKV;
+    atTime(T0);
+    const calls = stubFetch();
+    await run(env(noWrites, live)).catch(() => {});
+    expect(synthetic(calls)).toHaveLength(0);
+  });
+
+  it("does not text once per minute for as long as KV write fails", async () => {
+    // The measured failure was five texts in five runs: nothing could record
+    // the attempt, so every run looked due. Exhausting the KV write quota is
+    // exactly when this fires, and it is not a rare state to be in.
+    const kv = fakeKV();
+    const noWrites = {
+      writes: 0,
+      get: (k: string) => kv.get(k),
+      put: async () => {
+        throw new TypeError("KV write quota exceeded");
+      },
+    } as unknown as FakeKV;
+    const calls = stubFetch();
+    for (let i = 0; i < 5; i++) {
+      atTime(T0 + i * 60_000);
+      await run(env(noWrites, live)).catch(() => {});
+    }
+    expect(synthetic(calls)).toHaveLength(0);
+  });
+
+  it("writes each KV key at most once per run", async () => {
+    // Workers KV rate-limits to 1 write per key per second and throws 429
+    // beyond it. Two writes to one key inside a single invocation is over the
+    // published limit on the HAPPY path — a Twilio round trip is well under a
+    // second — not some quota edge case.
+    const kv = fakeKV();
+    const written: string[] = [];
+    const tracking = {
+      writes: 0,
+      get: (k: string) => kv.get(k),
+      put: async (k: string, v: string) => {
+        written.push(k);
+        return kv.put(k, v);
+      },
+    } as unknown as FakeKV;
+    atTime(T0);
+    stubFetch();
+    await run(env(tracking, live));
+    expect(written.length).toBeGreaterThan(0);
+    expect(new Set(written).size).toBe(written.length);
+  });
+
+  it("advances even when a repeat write to one key would be rate limited", async () => {
+    // Same-key rewrite inside a run throws 429 in production. If that is how
+    // success gets recorded, `ok` never advances and the test resends forever.
+    const kv = fakeKV();
+    let seen: string[] = [];
+    const rateLimited = {
+      writes: 0,
+      get: (k: string) => kv.get(k),
+      put: async (k: string, v: string) => {
+        if (seen.includes(k)) throw new Error("KV PUT failed: 429 Too Many Requests");
+        seen.push(k);
+        return kv.put(k, v);
+      },
+    } as unknown as FakeKV;
+    const calls = stubFetch();
+    atTime(T0);
+    seen = [];
+    await run(env(rateLimited, live));
+    expect(synthetic(calls)).toHaveLength(1);
+    // An hour later it must NOT fire again: delivery was proven at T0.
+    atTime(T0 + HOUR + 60_000);
+    seen = [];
+    await run(env(rateLimited, live));
+    expect(synthetic(calls)).toHaveLength(1);
   });
 
   it("does not text a delivery test when a check threw", async () => {
