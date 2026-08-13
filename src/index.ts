@@ -16,11 +16,19 @@
  *                   and "content", so Slack and Discord URLs work as-is
  *   SYNTHETIC_TEST_DAYS  text yourself every N whole days to prove the
  *                   notifier path still delivers. Off unless set.
+ *   EXPECT_TEXT / FORBID_TEXT  assert on the page body of a 2xx. Off unless
+ *                   set, and the body is not read otherwise. For the one case
+ *                   that earns it: an origin answering 200 with an error body.
+ *                   Applies to EVERY url in CHECK_URLS, so with more than one
+ *                   it will page on any that lacks the text.
  * Secrets (wrangler secret put): TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN,
  *   HEARTBEAT_URL   dead-man ping (healthchecks.io and equivalents). Pinged on
  *                   each run where foghorn could actually page someone, so a
  *                   third party raises the alarm when FOGHORN dies. A
  *                   capability URL — secret, not var.
+ *   DELIVERY_PING_URL  a SECOND dead-man check, for the delivery test alone.
+ *                   Pinged on a passing test, `/fail` on a failing one, so
+ *                   notifier rot pages you instead of only reaching a log.
  * Binding: STATE (KV namespace)
  */
 
@@ -34,7 +42,10 @@ interface Env {
   TWILIO_ACCOUNT_SID?: string;
   TWILIO_AUTH_TOKEN?: string;
   WEBHOOK_URL?: string;
+  EXPECT_TEXT?: string;
+  FORBID_TEXT?: string;
   HEARTBEAT_URL?: string;
+  DELIVERY_PING_URL?: string;
   SYNTHETIC_TEST_DAYS?: string;
 }
 
@@ -58,6 +69,8 @@ interface State {
 interface Probe {
   ok: boolean;
   status?: number;
+  /** Set when the server answered fine but the page itself was wrong. */
+  contentFail?: string;
 }
 
 /**
@@ -99,6 +112,10 @@ const SYNTHETIC_ATTEMPT_KEY = "synthetic:attempt";
 // Alert bodies must stay inside one 160-character GSM-7 segment; clamping the
 // host is what keeps that true for a name longer than the current one.
 const MAX_HOST_IN_SMS = 40;
+// Chunks are decoded in slices this size, so peak allocation while scanning a
+// page is bounded by the slice and the needle — not by the chunk, which can be
+// the whole body.
+const SCAN_SLICE_BYTES = 16_384;
 const SYNTHETIC_MESSAGE =
   "Foghorn: scheduled delivery test, NOT an outage. " +
   "Getting this means SMS alerts can still reach you.";
@@ -171,7 +188,7 @@ function errName(err: unknown): string {
 async function checkOne(env: Env, url: string, threshold: number): Promise<boolean> {
   const host = hostOf(url);
   const prev = await loadState(env, url);
-  const probe = await checkReachable(url);
+  const probe = await checkReachable(env, url);
 
   if (probe.ok) {
     if (prev.status === "down") {
@@ -237,7 +254,7 @@ async function saveState(env: Env, url: string, state: State): Promise<void> {
   await env.STATE.put(stateKey(url), JSON.stringify(state));
 }
 
-async function checkReachable(url: string): Promise<Probe> {
+async function checkReachable(env: Env, url: string): Promise<Probe> {
   // Cache-bust so the check always hits the origin, never a cached subrequest.
   // Via searchParams, not concatenation: appending to a URL carrying a
   // fragment puts `_cb` after the "#", where fetch strips it and the request
@@ -272,10 +289,102 @@ async function checkReachable(url: string): Promise<Probe> {
       signal: AbortSignal.timeout(CHECK_TIMEOUT_MS),
     });
     // 2xx/3xx = the server responded; 4xx/5xx or a thrown error = down
-    return { ok: resp.status >= 200 && resp.status < 400, status: resp.status };
+    if (resp.status < 200 || resp.status >= 400) return { ok: false, status: resp.status };
+
+    // Content assertion: OFF unless configured, and the body is not even read
+    // otherwise. It earns its place for exactly one case — an origin answering
+    // 200 with an error body, which plugin error handlers and maintenance
+    // pages do routinely. It does NOT address edge caching: a stale but
+    // healthy cached page passes any content check you can write.
+    // Only 2xx: under `redirect: "manual"` a 3xx is a Location header, not a page.
+    const expected = env.EXPECT_TEXT?.trim();
+    const forbidden = env.FORBID_TEXT?.trim();
+    if ((expected || forbidden) && resp.status < 300) {
+      // Applies to EVERY url in CHECK_URLS. Spec §2.6 wanted this per URL and
+      // this is not that — but the alternative considered, going inert on more
+      // than one URL, meant an operator who added a URL silently LOST the
+      // assertion protecting the original. Under §1 a loud false page beats a
+      // quiet miss, so it asserts on all of them and the docs say so.
+      const needles = [expected, forbidden].filter((n): n is string => Boolean(n));
+      const { found, complete } = await scanBody(resp, needles);
+      if (expected && !found.has(expected)) {
+        return { ok: false, status: resp.status, contentFail: "missing text" };
+      }
+      if (forbidden && found.has(forbidden)) {
+        return { ok: false, status: resp.status, contentFail: "forbidden text" };
+      }
+      // Absence only counts if the whole body was actually scanned. A stream
+      // that died mid-page cannot prove the forbidden string is not there, and
+      // an unprovable absence is a miss — so fail closed.
+      if (forbidden && !complete) {
+        return { ok: false, status: resp.status, contentFail: "unreadable page" };
+      }
+    }
+    return { ok: true, status: resp.status };
   } catch {
     return { ok: false };
   }
+}
+
+/**
+ * Streams the body looking for needles, keeping only enough of the previous
+ * chunk to catch a match that straddles a boundary, and decoding each chunk in
+ * SCAN_SLICE_BYTES pieces so one huge chunk cannot be materialised whole. Peak
+ * allocation is a slice plus the longest needle, so there is no size cap and
+ * therefore no cap for a match to hide past. Reports whether the whole body was
+ * scanned, because "absent" is only trustworthy if the scan actually finished.
+ */
+async function scanBody(
+  resp: Response,
+  needles: string[],
+): Promise<{ found: Set<string>; complete: boolean }> {
+  const found = new Set<string>();
+  if (!resp.body || needles.length === 0) return { found, complete: true };
+
+  // Only enough of the previous chunk to catch a match straddling a boundary.
+  const carrySize = Math.max(...needles.map((n) => n.length)) - 1;
+  let complete = false;
+  let carry = "";
+  try {
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    try {
+      const consume = (piece: string) => {
+        if (!piece) return;
+        const window = carry + piece;
+        for (const needle of needles) {
+          if (!found.has(needle) && window.includes(needle)) found.add(needle);
+        }
+        carry = carrySize > 0 ? window.slice(-carrySize) : "";
+      };
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) {
+          consume(decoder.decode()); // flush any trailing partial sequence
+          complete = true;
+          break;
+        }
+        // Decode the chunk in bounded slices. A whole-chunk decode makes peak
+        // allocation the size of the CHUNK — and a body can arrive as one
+        // 300KB chunk, which is how the previous two attempts at this quietly
+        // stayed unbounded. `subarray` is a view, and the streaming decoder
+        // carries partial multi-byte sequences across slice boundaries.
+        for (let i = 0; i < value.length && found.size < needles.length; i += SCAN_SLICE_BYTES) {
+          consume(decoder.decode(value.subarray(i, i + SCAN_SLICE_BYTES), { stream: true }));
+        }
+        // Every needle located; the rest of the page cannot change the verdict.
+        if (found.size === needles.length) {
+          complete = true;
+          break;
+        }
+      }
+    } finally {
+      await reader.cancel().catch(() => {});
+    }
+  } catch {
+    // Stream died mid-scan. `complete` stays false and the caller fails closed.
+  }
+  return { found, complete };
 }
 
 /**
@@ -301,6 +410,12 @@ function smsHost(host: string): string {
 function downMessage(rawHost: string, probe: Probe, fails: number): string {
   const host = smsHost(rawHost);
   const tail = `${fails} consecutive fails.`;
+  if (probe.contentFail) {
+    return (
+      `Foghorn: ${host} appears DOWN - answered HTTP ${probe.status} ` +
+      `but content is wrong (${probe.contentFail}), ${tail}`
+    );
+  }
   if (probe.status === undefined) {
     return `Foghorn: ${host} appears DOWN - unreachable, ${tail}`;
   }
@@ -394,10 +509,9 @@ async function loadSynthetic(env: Env): Promise<Synthetic> {
  * Records success and attempts separately, so a failure neither burns the
  * interval nor passes for proof: it retries hourly until it lands.
  *
- * KNOWN GAP: a failure is loud in the logs but pages nobody. Wiring it to the
- * heartbeat looked like the answer and is not — see the deadlock described at
- * the call site. The real fix is the dead-man provider's own failure endpoint,
- * which needs a provider chosen first.
+ * A failure reports to its own dead-man check via `deliveryAlarm()`, so it
+ * pages rather than only reaching a log. Wiring it to the LIVENESS heartbeat
+ * looked like the answer and is not — see the deadlock at the call site.
  *
  * KNOWN GAP: with several notifiers configured, `notify()` succeeds if ANY of
  * them delivers, so this proves at least one path works, not that all do. A
@@ -441,8 +555,11 @@ async function runSyntheticTest(
       `Foghorn: SYNTHETIC DELIVERY TEST FAILED (${errName(err)}) — ` +
         `alerts may not be reaching anyone. Retrying hourly until it lands.`,
     );
+    // The log alone pages nobody, which is the hole this closes.
+    await deliveryAlarm(env, false);
     return;
   }
+  await deliveryAlarm(env, true);
 
   try {
     await env.STATE.put(SYNTHETIC_OK_KEY, String(now));
@@ -470,19 +587,45 @@ async function runSyntheticTest(
  */
 async function heartbeat(env: Env): Promise<void> {
   if (!env.HEARTBEAT_URL) return;
+  await ping(env.HEARTBEAT_URL, "heartbeat");
+}
+
+/**
+ * Reports the delivery test's verdict to its OWN dead-man check, using
+ * healthchecks.io's convention that `<ping-url>/fail` marks a check down
+ * immediately.
+ *
+ * A second check rather than reusing the heartbeat's: the liveness signal and
+ * the can-foghorn-reach-you signal answer different questions and fail at
+ * different times. Sharing one check would flap it down and up every hour
+ * while delivery is broken, which trains the operator to ignore it — and the
+ * next successful heartbeat would silently clear a failure nobody saw.
+ *
+ * Set its period to the delivery-test interval, not a minute: it is pinged
+ * once per test, not once per run.
+ */
+async function deliveryAlarm(env: Env, delivered: boolean): Promise<void> {
+  const base = env.DELIVERY_PING_URL;
+  if (!base) return;
+  const url = base.replace(/\/+$/, "") + (delivered ? "" : "/fail");
+  await ping(url, delivered ? "delivery-ok" : "DELIVERY-FAIL");
+}
+
+/** Fire-and-forget GET at a dead-man service. Never throws. */
+async function ping(url: string, what: string): Promise<void> {
   try {
-    const resp = await fetch(env.HEARTBEAT_URL, {
+    const resp = await fetch(url, {
       method: "GET",
       headers: { "User-Agent": USER_AGENT },
       signal: AbortSignal.timeout(HEARTBEAT_TIMEOUT_MS),
     });
     if (!resp.ok) {
-      console.error(`Foghorn: heartbeat ping failed — HTTP ${resp.status}`);
+      console.error(`Foghorn: ${what} ping failed — HTTP ${resp.status}`);
     }
   } catch (err) {
-    // Name only: HEARTBEAT_URL is a capability — anyone holding it can forge a
-    // heartbeat — and fetch errors can carry the URL into observability logs.
-    console.error(`Foghorn: heartbeat ping failed — ${errName(err)}`);
+    // Name only: these are capability URLs — anyone holding one can forge a
+    // ping — and fetch errors can carry the URL into observability logs.
+    console.error(`Foghorn: ${what} ping failed — ${errName(err)}`);
   }
 }
 

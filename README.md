@@ -84,6 +84,8 @@ All plain vars in `wrangler.jsonc` (secrets via `wrangler secret put`):
 | `WEBHOOK_URL` | for webhook | Any Slack/Discord-compatible webhook endpoint. |
 | `HEARTBEAT_URL` | no (**secret**) | Dead-man ping URL from healthchecks.io or equivalent, pinged on each run that foghorn could actually page you (see below). This is what raises the alarm when *foghorn itself* dies. A capability URL — use `wrangler secret put`, not a var. |
 | `SYNTHETIC_TEST_DAYS` | no | Text yourself every N **whole** days to prove the delivery path still works. Off unless set; enabling it sends one on the next cron. Costs one text per interval. |
+| `DELIVERY_PING_URL` | no (**secret**) | A **second** dead-man check, watching the delivery test alone. Pinged when the test passes, `/fail` when it fails — so notifier rot pages you instead of only reaching a log. Set its period to the test interval, not a minute. |
+| `EXPECT_TEXT` / `FORBID_TEXT` | no | Assert on the page body of a 2xx: page if the expected text is missing, or the forbidden text appears. Off unless set, and the body is not read otherwise. Applies to **every** URL in `CHECK_URLS` — see below before using it with more than one. |
 
 A check counts as **up** on any 2xx/3xx response. A 4xx, a 5xx, a timeout
 (10s), or a refused connection all count as **down** — if your homepage starts
@@ -124,15 +126,38 @@ a URL is down (a real DOWN alert proves the same thing, and SMS arrival order
 isn't guaranteed).
 
 A failed delivery test retries hourly until it lands, so one transient blip
-can't hide notifier rot for a month. Two limits worth knowing, both recorded in
-the source: **a failure is loud in the logs but pages nobody** — wiring it to
-the heartbeat deadlocks, and the real answer is your dead-man provider's own
-failure endpoint — and **with several notifiers configured it proves at least
+can't hide notifier rot for a month — and with `DELIVERY_PING_URL` set it hits
+that check's `/fail` endpoint, so the failure **pages you** instead of reaching
+a log nobody reads. It deliberately does not touch the liveness heartbeat:
+withholding that during an outage deadlocks, which is a mistake this codebase
+made once already.
+
+One limit worth knowing: **with several notifiers configured it proves at least
 one path works, not all of them**, so a rotated Twilio token can hide behind a
 working Slack webhook.
 
 Pick a provider whose delivery path differs from your notifier's, or one Twilio
 outage takes both alarms down at once.
+
+### When the page lies
+
+A server can answer `200` and still be broken — a plugin error handler or a
+maintenance page returning a cheerful status with an error body. `EXPECT_TEXT`
+and `FORBID_TEXT` catch exactly that, and nothing else: **a stale-but-healthy
+cached page passes any content check you can write**, so this is not a defence
+against caching. Off by default, because a homepage copy change will page you
+at 3am if you forget it's on.
+
+It **applies to every URL in `CHECK_URLS`**, so with more than one it will page
+on any that lacks the text. That is deliberate: the alternative — going inert
+on multiple URLs — meant adding a URL silently killed the assertion protecting
+the original, and a quiet miss is worse than a loud false page.
+
+The body is scanned as a stream with a sliding window sized to the search
+string, decoded in small slices, so peak memory is bounded by that slice rather
+than by the page: there is no size limit, and no limit for a match to hide past. If the body dies mid-scan
+it pages rather than assuming the page was clean — an absence you cannot prove
+is a miss.
 
 ## What this deliberately is not
 

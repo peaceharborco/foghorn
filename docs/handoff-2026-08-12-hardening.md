@@ -84,9 +84,15 @@ it only proves ONE path" caveat does not currently bite.
 
 ## Also open
 
-- **A failed delivery test pages nobody** — it logs and retries. The fix is
-  healthchecks.io's `/fail` endpoint, ideally against a second dedicated check
-  so it does not flap the liveness one.
+- **Content assertion is per-deployment, not per URL.** Spec §2.6 asked for per
+  URL; it applies to every entry in `CHECK_URLS`. Going inert on more than one
+  was tried and reverted — it meant adding a URL silently killed the assertion
+  protecting the original, and §1 puts a quiet miss below a loud false page.
+  Make it per URL before watching several URLs with it on.
+- **The checked URL is a 163-byte cPanel default page**, so "up" means "Apache
+  answered", not "the sites work". Pointing `CHECK_URLS` at a health endpoint
+  that touches PHP and the database would be a bigger win than anything left
+  in this spec — and would give the content assertion something worth asserting.
 
 ---
 

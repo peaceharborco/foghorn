@@ -33,6 +33,7 @@ function fakeKV(): FakeKV {
 function stubFetch(
   down: Set<string> = new Set(),
   failure: number | "throw" = 500,
+  healthyBody = "ok",
 ): FetchCall[] {
   const calls: FetchCall[] = [];
   vi.stubGlobal("fetch", async (url: string | URL, init?: RequestInit) => {
@@ -43,7 +44,7 @@ function stubFetch(
       if (failure === "throw") throw new TypeError("fetch failed");
       return new Response("err", { status: failure });
     }
-    return new Response("ok", { status: 200 });
+    return new Response(healthyBody, { status: 200 });
   });
   return calls;
 }
@@ -781,6 +782,235 @@ describe("delivery-path failure is not silent", () => {
     );
     expect(outbound.length).toBeGreaterThan(0);
     for (const c of outbound) expect(c.init?.signal).toBeDefined();
+  });
+});
+
+describe("content assertion", () => {
+  const bodyText = "Welcome to the server";
+  const twice = async (e: never) => {
+    await run(e);
+    await run(e);
+  };
+
+  it("is off unless configured — the body is never even read", async () => {
+    const kv = fakeKV();
+    const calls = stubFetch(new Set(), 500, "There has been a critical error");
+    await twice(env(kv));
+    expect(smsCalls(calls)).toHaveLength(0);
+  });
+
+  it("stays up when EXPECT_TEXT is present", async () => {
+    const kv = fakeKV();
+    const calls = stubFetch(new Set(), 500, bodyText);
+    await twice(env(kv, { EXPECT_TEXT: "Welcome" }));
+    expect(smsCalls(calls)).toHaveLength(0);
+  });
+
+  it("pages when EXPECT_TEXT is missing from a 200", async () => {
+    // The one case this earns its place: an origin answering 200 with an error
+    // body. A plugin error handler or a maintenance page does exactly that.
+    const kv = fakeKV();
+    const calls = stubFetch(new Set(), 500, "There has been a critical error");
+    await twice(env(kv, { EXPECT_TEXT: "Welcome" }));
+    const sms = smsCalls(calls);
+    expect(sms).toHaveLength(1);
+    expect(smsBody(sms[0])).toContain("DOWN");
+    expect(smsBody(sms[0])).toContain("200");
+  });
+
+  it("pages when FORBID_TEXT appears in a 200", async () => {
+    const kv = fakeKV();
+    const calls = stubFetch(new Set(), 500, "There has been a critical error");
+    await twice(env(kv, { FORBID_TEXT: "critical error" }));
+    expect(smsCalls(calls)).toHaveLength(1);
+  });
+
+  it("says the content is wrong, not that the server was unreachable", async () => {
+    const kv = fakeKV();
+    const calls = stubFetch(new Set(), 500, "nope");
+    await twice(env(kv, { EXPECT_TEXT: "Welcome" }));
+    const body = smsBody(smsCalls(calls)[0]);
+    expect(body).not.toContain("unreachable");
+    expect(body).toMatch(/content|body|page/i);
+  });
+
+  it("finds a match anywhere in the body, however large", async () => {
+    // There is no read cap to hide past: the scan is a sliding window bounded
+    // by the needle, not a buffer bounded by an arbitrary size.
+    const kv = fakeKV();
+    const huge = "A".repeat(300_000) + "NEEDLE";
+    const calls = stubFetch(new Set(), 500, huge);
+    await twice(env(kv, { FORBID_TEXT: "NEEDLE" }));
+    expect(smsCalls(calls)).toHaveLength(1);
+  });
+
+  it("finds a match straddling a chunk boundary", async () => {
+    // The whole reason for the carry-over window.
+    const kv = fakeKV();
+    const calls: FetchCall[] = [];
+    vi.stubGlobal("fetch", async (url: string | URL, init?: RequestInit) => {
+      const u = String(url);
+      calls.push({ url: u, init });
+      if (!u.startsWith("https://a.example")) return new Response("ok", { status: 200 });
+      const enc = new TextEncoder();
+      return new Response(
+        new ReadableStream({
+          start(c) {
+            c.enqueue(enc.encode("aaaaaaNEE"));
+            c.enqueue(enc.encode("DLEbbbbbb"));
+            c.close();
+          },
+        }),
+        { status: 200 },
+      );
+    });
+    await twice(env(kv, { FORBID_TEXT: "NEEDLE" }));
+    expect(smsCalls(calls)).toHaveLength(1);
+  });
+
+  it("pages when the body dies mid-scan and cannot prove absence", async () => {
+    // An unprovable absence is a miss, and a miss outranks a false page.
+    const kv = fakeKV();
+    const calls: FetchCall[] = [];
+    vi.stubGlobal("fetch", async (url: string | URL, init?: RequestInit) => {
+      const u = String(url);
+      calls.push({ url: u, init });
+      if (!u.startsWith("https://a.example")) return new Response("ok", { status: 200 });
+      const enc = new TextEncoder();
+      return new Response(
+        new ReadableStream({
+          start(c) {
+            c.enqueue(enc.encode("harmless prefix"));
+            c.error(new Error("connection reset mid-body"));
+          },
+        }),
+        { status: 200 },
+      );
+    });
+    await twice(env(kv, { FORBID_TEXT: "critical error" }));
+    expect(smsCalls(calls)).toHaveLength(1);
+  });
+
+  it("applies to every watched URL", async () => {
+    // Spec §2.6 wanted this per URL and it is not. Going inert on more than
+    // one URL was tried and reverted: it meant adding a URL silently killed
+    // the assertion protecting the original. A loud false page beats that.
+    const kv = fakeKV();
+    const calls = stubFetch(new Set(), 500, "nothing matching here");
+    const e = env(kv, {
+      CHECK_URLS: "https://a.example, https://b.example",
+      EXPECT_TEXT: "Welcome",
+    });
+    await twice(e);
+    expect(smsCalls(calls).length).toBeGreaterThan(0);
+  });
+
+  it("recovers when the content comes back", async () => {
+    const kv = fakeKV();
+    stubFetch(new Set(), 500, "nope");
+    await twice(env(kv, { EXPECT_TEXT: "Welcome" }));
+    const recovered = stubFetch(new Set(), 500, bodyText);
+    await run(env(kv, { EXPECT_TEXT: "Welcome" }));
+    const sms = smsCalls(recovered);
+    expect(sms).toHaveLength(1);
+    expect(smsBody(sms[0])).toContain("UP");
+  });
+});
+
+describe("delivery alarm", () => {
+  const T0 = 1_700_000_000_000;
+  const HB = "https://hc.example/ping/abc123";
+  const DELIVERY = "https://hc.example/ping/delivery456";
+  const HOUR = 3_600_000;
+  const live = {
+    HEARTBEAT_URL: HB,
+    DELIVERY_PING_URL: DELIVERY,
+    SYNTHETIC_TEST_DAYS: "30",
+  };
+  const okPings = (c: FetchCall[]) => c.filter((x) => x.url === DELIVERY);
+  const failPings = (c: FetchCall[]) => c.filter((x) => x.url === DELIVERY + "/fail");
+
+  it("reports success to its own check, separate from the liveness one", async () => {
+    // A second check, so a delivery failure does not flap the "is foghorn
+    // alive" signal down and up every hour until it is ignored.
+    const kv = fakeKV();
+    atTime(T0);
+    const calls = stubFetch();
+    await run(env(kv, live));
+    expect(okPings(calls)).toHaveLength(1);
+    expect(failPings(calls)).toHaveLength(0);
+  });
+
+  it("raises the alarm when the delivery test fails", async () => {
+    // This is the whole point: notifier rot stops being a log line nobody
+    // reads and becomes a page over a channel that still works.
+    const kv = fakeKV();
+    atTime(T0);
+    const calls = stubFetch(new Set(["https://api.twilio.com"]));
+    await run(env(kv, live));
+    expect(failPings(calls)).toHaveLength(1);
+    expect(okPings(calls)).toHaveLength(0);
+  });
+
+  it("clears the alarm when delivery recovers", async () => {
+    const kv = fakeKV();
+    atTime(T0);
+    stubFetch(new Set(["https://api.twilio.com"]));
+    await run(env(kv, live));
+    const recovered = stubFetch();
+    atTime(T0 + HOUR);
+    await run(env(kv, live));
+    expect(okPings(recovered)).toHaveLength(1);
+  });
+
+  it("stays silent on runs where no delivery test was due", async () => {
+    // The delivery check's period is the test interval, not a minute. Pinging
+    // it every run would make it meaningless.
+    const kv = fakeKV();
+    atTime(T0);
+    stubFetch();
+    await run(env(kv, live));
+    atTime(T0 + 60_000);
+    const later = stubFetch();
+    await run(env(kv, live));
+    expect(okPings(later)).toHaveLength(0);
+    expect(failPings(later)).toHaveLength(0);
+  });
+
+  it("does nothing when DELIVERY_PING_URL is unset", async () => {
+    const kv = fakeKV();
+    atTime(T0);
+    const calls = stubFetch();
+    await run(env(kv, { HEARTBEAT_URL: HB, SYNTHETIC_TEST_DAYS: "30" }));
+    expect(calls.filter((c) => c.url.includes("delivery"))).toHaveLength(0);
+  });
+
+  it("does not break the run when the alarm ping itself fails", async () => {
+    const kv = fakeKV();
+    atTime(T0);
+    stubFetch(new Set([DELIVERY]));
+    await expect(run(env(kv, live))).resolves.toBeUndefined();
+  });
+
+  it("still sends the liveness heartbeat on the same run", async () => {
+    // Guards the regression class that has bitten this project twice: a
+    // coupling that only appears once the new secret is set would otherwise
+    // pass the whole suite, because the heartbeat tests never set it.
+    const kv = fakeKV();
+    atTime(T0);
+    const calls = stubFetch();
+    await run(env(kv, live));
+    expect(calls.filter((c) => c.url === HB)).toHaveLength(1);
+    expect(okPings(calls)).toHaveLength(1);
+  });
+
+  it("keeps the heartbeat alive when the delivery test fails", async () => {
+    const kv = fakeKV();
+    atTime(T0);
+    const calls = stubFetch(new Set(["https://api.twilio.com"]));
+    await run(env(kv, live));
+    expect(calls.filter((c) => c.url === HB)).toHaveLength(1);
+    expect(failPings(calls)).toHaveLength(1);
   });
 });
 

@@ -45,6 +45,13 @@
     // DELIVER. Left commented out on purpose: it sends a real text on the very
     // next cron, so turning it on is your call, not the template's.
     //   "SYNTHETIC_TEST_DAYS": "30"
+
+    // Assert on the page body of a 2xx, for the one case that earns it: an
+    // origin answering 200 with an error body. Off unless set; a homepage copy
+    // change will page you if you forget it is on. Applies to EVERY url above,
+    // so with more than one it pages on any that lacks the text.
+    //   "EXPECT_TEXT": "Welcome",
+    //   "FORBID_TEXT": "There has been a critical error"
   },
   "kv_namespaces": [
     // id is filled in after `wrangler kv namespace create STATE`
@@ -59,4 +66,10 @@
   // anyone holding it can forge a heartbeat — so it goes in a secret, never
   // in "vars" above:
   //   wrangler secret put HEARTBEAT_URL
+  //
+  // A SECOND dead-man check, watching only the delivery test: pinged when it
+  // passes, <url>/fail when it fails. Without this a failed delivery test
+  // reaches a log and nothing else. Give it a period matching the test
+  // interval, not a minute:
+  //   wrangler secret put DELIVERY_PING_URL
 }
