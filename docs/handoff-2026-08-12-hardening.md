@@ -1,8 +1,18 @@
-# Handoff — foghorn hardening, steps 1–4 shipped (2026-08-12)
+# Handoff — foghorn hardening, shipped (2026-08-12, verified 2026-08-13)
 
 **Repo:** `foghorn` · **Worker:** `down-detector`, version `e2f54d2c`, **DEPLOYED**.
-**Status:** steps 1–4 of the sequencing below are built, reviewed across five
-gate rounds, and live. Steps 5–8 are untouched. 53 tests, typecheck clean.
+**Status:** steps 1–4 are built, reviewed across five gate rounds, and live —
+**as are three things the step list never numbered**: the `no-store` /
+`redirect: manual` probe levers, the delivery-failure ping
+(`DELIVERY_PING_URL` → `/fail`), and the opt-in content assertion.
+Step 5 cancelled itself, step 6 is deferred, step 8 is untouched and lives in
+another repo. **79 tests**, typecheck clean.
+
+**Re-verified live 2026-08-13** against the running Worker, not against this
+document: version `e2f54d2c` (uploaded `2026-08-13T02:20:13Z`, 12 seconds after
+commit `71928f4` — so the deployed code *is* HEAD's code), cron firing every
+60s, `outcome: ok`, no errors. See §8 for the full deployed-state table and the
+config-drift trap it uncovered.
 
 **Artifacts:** `docs/specs/2026-08-12-hardening-design.md` (rev 2) and its review,
 `…-hardening-design-review-grok.md`. Rev 2 is the one to read; rev 1 was wrong in
@@ -13,7 +23,9 @@ several places and rev 2 says where.
 | **What foghorn is** | A dead-man alarm: cron Worker, one file, texts the operator when cds1 stops answering. Not a status page — the README declines that on purpose. |
 | **Biggest gap found** | Nothing *pages* when foghorn itself dies. §2.1 — now closed by `HEARTBEAT_URL`. |
 | **Biggest correction** | Three of rev 1's claims about the `swatter` repo were wrong. §5. |
-| **Next to build** | Nothing required. Step 5 was run and CANCELLED itself (spec §0.5); step 6 is deferred behind a trigger. Remaining: wire healthchecks.io `/fail`, and step 8 in the *swatter* repo. |
+| **Next to build** | Nothing required. Step 5 was run and CANCELLED itself (spec §0.5); step 6 is deferred behind a trigger. healthchecks.io `/fail` **is now wired** — `DELIVERY_PING_URL` is set on the live Worker. Remaining: step 8 in the *swatter* repo. |
+| **Highest-value item left** | Not in this spec at all: point `CHECK_URLS` at a health endpoint that touches PHP and the database. Today "up" means Apache answered a 163-byte cPanel default page. |
+| **Trap for the next machine** | `wrangler.jsonc` is gitignored, so it drifts per-machine and git cannot see it. It had silently drifted on the iMac. §8. |
 
 ## What shipped, and what it cost to get right
 
@@ -106,11 +118,12 @@ each under a correctness and a safety lens) then took rev 1 apart.
 Nothing here is urgent. Foghorn works. This is about the ways it could be lying to
 you without either of you noticing.
 
-## 2. What rev 2 proposes, in build order — steps 1–4 are DONE
+## 2. What rev 2 proposes, in build order — only step 8 is still open
 
-**Steps 1–4 below are built, gated and deployed.** They are kept here as the
-record of what was intended and why; read them as history, not as a task list.
-Step 5 is where work resumes.
+**This whole list is now history, not a task list.** Steps 1–4 are built, gated
+and deployed; 5 cancelled itself; 6 is deferred behind a trigger; 7 shipped out
+of order. **Step 8 is the only entry left, and it is work in the swatter repo.**
+Kept below as the record of what was intended and why.
 
 1. **Set a User-Agent.** One line. Workers `fetch` sends none, confirmed by live
    evidence — foghorn's own probe appears in cds1's `access_log` with UA `"-"`.
@@ -127,13 +140,22 @@ Step 5 is where work resumes.
 4. **Periodic synthetic send.** Nothing else tests whether Twilio would actually
    deliver. If the auth token rots, foghorn stays "healthy" until the first missed
    outage.
-5. **The origin-probe experiment** — see §3. Blocks step 6.
+5. ~~**The origin-probe experiment**~~ — see §3. **RUN, AND IT CANCELLED
+   ITSELF.** `cds1` turned out to be DNS-only already, so there is no Cloudflare
+   edge in front of it and foghorn had been probing the origin all along. Spec
+   §0.5 has the evidence. §3 below is preserved as the method, not as a to-do.
 6. **`CF-Cache-Status` assertion**, fail-open, with rev 2's corrected table.
-7. **Content assertion**, opt-in, default off, and only for 200-with-error-body.
+   **DEFERRED, not cancelled** — a Worker subrequest still reads through a
+   Cloudflare cache even for a DNS-only host. **Trigger: any host in
+   `CHECK_URLS` becoming proxied (orange-cloud) reopens this immediately.**
+7. ~~**Content assertion**~~, opt-in, default off, and only for
+   200-with-error-body. **SHIPPED** (`71928f4`) as `EXPECT_TEXT` /
+   `FORBID_TEXT` — out of order, ahead of 5 and 6. Unset in production; see §8.
+   Still per-deployment rather than per-URL — see "Also open" above.
 8. **Swatter-side cross-check** (nightly "did foghorn probe me?"). Work in the
-   *swatter* repo, listed here so it is not lost.
+   *swatter* repo, listed here so it is not lost. **The only step still open.**
 
-## 3. The experiment that gates step 6 — run this before writing code
+## 3. The experiment that gated step 6 — ALREADY RUN, see §0.5 of the spec
 
 Rev 1 assumed `cf.resolveOverride` was the mechanism for probing the origin
 directly. It requires both hosts to be in the Worker's own zone and is **silently
@@ -193,7 +215,7 @@ gate D should use the corrected reasoning.
 
 ## 6. Gotchas for whoever builds this
 
-- **The test suite is no longer small — 16 tests became 53** — but it still
+- **The test suite is no longer small — 16 tests became 79** — but it still
   stubs `fetch` coarsely. `stubFetch` now takes a failure mode (an HTTP status,
   or `"throw"` for the no-response case) and `atTime` pins `Date.now()`. Still
   true and still relevant to step 6: **no test asserts response headers**, so a
@@ -231,9 +253,80 @@ gate D should use the corrected reasoning.
    free tier, alerting by email and push with SMS off, so the alarm-on-the-alarm
    shares no delivery path with Twilio. Live and pinging. Its ping URL is a
    capability — a plain GET *is* a heartbeat — and is stored as a Worker secret.
-2. **Is the grey-cloud hostname acceptable?** It publishes the origin IP in DNS.
-   That is already inferable, and origin-lock is the actual defence, but it is a
-   deliberate exposure and belongs to the operator, not to me.
+2. ~~**Is the grey-cloud hostname acceptable?**~~ — **MOOT 2026-08-12.** It died
+   with step 5: spec §0.5 found `cds1` is *already* DNS-only and already
+   publishes the origin IP, so there was no new exposure to consent to and no
+   hostname to create.
 3. **Free plan or paid?** It decides whether §2.5's state endpoint is ever revived.
 4. ~~**Is a monthly synthetic SMS acceptable noise**~~ — **ANSWERED 2026-08-12:
    yes, enabled at 30 days** and confirmed delivering.
+
+---
+
+## 8. Deployed state, verified 2026-08-13 — and the config-drift trap
+
+Everything below was read from the **running Worker**, not from this repo. Do
+this again rather than trusting the table; that is the whole point of it.
+
+| Surface | Live value |
+|---|---|
+| Version | `e2f54d2c-ced2-4f4b-bc19-f5c2e3e6e9a2`, uploaded `2026-08-13T02:20:13Z` |
+| Handlers | `scheduled` only — still no `fetch`, as §4 intends |
+| Cron | `* * * * *`, `outcome: ok`, ~1.4s wall, 1–2ms CPU |
+| `workers_dev` | **disabled** (`subdomain.enabled: false`) — spec §2.5 holds |
+| Vars | `CHECK_URL` *(singular)*, `FAIL_THRESHOLD=2`, `SYNTHETIC_TEST_DAYS=30`, `TWILIO_FROM`, `TWILIO_TO` |
+| Secrets | `HEARTBEAT_URL`, `DELIVERY_PING_URL`, `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN` |
+| KV | `STATE` → `9ce11ab5c5c14513a74861e3629c9381` |
+| Not set | `WEBHOOK_URL`, `EXPECT_TEXT`, `FORBID_TEXT` — the content assertion is **off in production**, which is its documented default |
+
+Two things worth internalising from that table:
+
+- **`CHECK_URL` is singular in production.** `src/index.ts` accepts
+  `CHECK_URLS ?? CHECK_URL`, so this is correct, not drift — but the example
+  file and every doc say `CHECK_URLS`. Do not "fix" the live var without
+  meaning to.
+- **The content assertion has never run against production.** It is tested and
+  deployed but unset, so its first real exercise will be whenever someone turns
+  it on. Turn it on deliberately, not incidentally.
+
+### The trap: `wrangler.jsonc` drifts per machine and git cannot see it
+
+`wrangler.jsonc` is **gitignored**. That protects the phone numbers, and it
+means **the deployed configuration lives on whichever Mac last deployed** —
+there is no version control, no diff, and no warning.
+
+Found live on 2026-08-13: the iMac's copy was dated **Jul 22**, predating this
+entire spec. It was missing `workers_dev: false` **and**
+`SYNTHETIC_TEST_DAYS: "30"`. A routine `wrangler deploy` from that machine
+would have silently, in one command:
+
+1. **re-enabled the `workers.dev` URL** — restoring the invocation-burn path
+   that can stop the cron, which is precisely the silent death `HEARTBEAT_URL`
+   exists to catch; and
+2. **switched off the synthetic delivery test** — removing the only proof that
+   Twilio still delivers.
+
+Both regressions are *quiet*. Nothing would have alerted, and the heartbeat
+would have stayed green through the first one right up until the invocation cap
+bit. Reconciled and verified with `wrangler deploy --dry-run`, whose bindings
+now match the live version exactly.
+
+**Before deploying from any machine, diff the local config against the live
+Worker** — `wrangler versions view <id> --name down-detector` lists vars,
+secrets and bindings, and the `…/workers/scripts/down-detector/subdomain` API
+endpoint is what tells you `workers_dev`, which `versions view` does *not*
+show. Note the Cloudflare API token cannot read script *content*
+(`10405: Method not allowed for this authentication scheme`), so verify
+deployed code by comparing the upload timestamp against the last code commit —
+here, 12 seconds apart.
+
+### Housekeeping done the same day
+
+- `wrangler` 4.112.0 → 4.122.0 (`cedcd79`). The emitted bundle is byte-for-byte
+  identical across both versions (13,170 bytes, sha256 `3462f26a…`), so it
+  changed the deploy tool and not the deployed artifact.
+- Pushes go to **two remotes** — GitHub and a GitLab mirror. A push that
+  succeeds on one and fails on the other will look half-done; check both lines.
+- `.gitignore` matches `wrangler.jsonc` **exactly**, not `wrangler.jsonc.*`. A
+  file like `wrangler.jsonc.bak` is therefore untracked-but-visible in a public
+  repo, carrying real phone numbers. Do not leave backups next to it.
