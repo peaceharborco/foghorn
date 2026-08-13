@@ -1,6 +1,6 @@
 # Handoff — foghorn hardening, steps 1–4 shipped (2026-08-12)
 
-**Repo:** `foghorn` · **Worker:** `down-detector`, version `fe6c3d00`, **DEPLOYED**.
+**Repo:** `foghorn` · **Worker:** `down-detector`, version `f48a4ec1`, **DEPLOYED**.
 **Status:** steps 1–4 of the sequencing below are built, reviewed across five
 gate rounds, and live. Steps 5–8 are untouched. 53 tests, typecheck clean.
 
@@ -13,7 +13,7 @@ several places and rev 2 says where.
 | **What foghorn is** | A dead-man alarm: cron Worker, one file, texts the operator when cds1 stops answering. Not a status page — the README declines that on purpose. |
 | **Biggest gap found** | Nothing *pages* when foghorn itself dies. §2.1 — now closed by `HEARTBEAT_URL`. |
 | **Biggest correction** | Three of rev 1's claims about the `swatter` repo were wrong. §5. |
-| **Next to build** | Step 5, the origin-probe experiment. It gates step 6. |
+| **Next to build** | Nothing required. Step 5 was run and CANCELLED itself (spec §0.5); step 6 is deferred behind a trigger. Remaining: wire healthchecks.io `/fail`, and step 8 in the *swatter* repo. |
 
 ## What shipped, and what it cost to get right
 

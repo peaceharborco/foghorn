@@ -266,6 +266,55 @@ describe("cache busting", () => {
   });
 });
 
+describe("probing the origin, not the edge", () => {
+  const probeInit = async () => {
+    const kv = fakeKV();
+    const calls = stubFetch();
+    await run(env(kv));
+    return calls[0].init;
+  };
+
+  it("bypasses Cloudflare's cache", async () => {
+    // A Worker subrequest reads through a Cloudflare cache even for a
+    // DNS-only hostname, because the name still belongs to a Cloudflare zone.
+    // The `_cb` buster makes a HIT unlikely; this makes it impossible.
+    expect((await probeInit())?.cache).toBe("no-store");
+  });
+
+  it("does not follow redirects", async () => {
+    // `follow` is the default, and this zone's apex 301s at the edge to a
+    // proxied property that already serves cf-cache-status: REVALIDATED.
+    // Following it would turn "cds1 answered a redirect" into "some other
+    // host's cached page said 200" — a healthy reading of a dead box.
+    expect((await probeInit())?.redirect).toBe("manual");
+  });
+
+  // Not following is not the same as failing: a 3xx means the origin answered,
+  // which is the whole question foghorn asks. This is also the QUIETER half of
+  // the trade — `follow` used to score the redirect target, so a 3xx pointing
+  // at a corpse would have paged and now does not. Deliberate, documented in
+  // spec §6, and a no-op on the deployed URL, which answers 200.
+  it.each([301, 302, 303, 307, 308])("counts a %i from the origin as up", async (status) => {
+    const kv = fakeKV();
+    const calls = stubFetch(new Set(["https://a.example"]), status);
+    await run(env(kv));
+    await run(env(kv));
+    expect(smsCalls(calls)).toHaveLength(0);
+    expect(kv.writes).toBe(0);
+  });
+
+  it("still pages when the first hop itself fails", async () => {
+    // The guard on the trade: `manual` must not make a genuinely unreachable
+    // origin quieter. Only the redirect-target check was given up.
+    const kv = fakeKV();
+    const calls = stubFetch(new Set(["https://a.example"]), "throw");
+    await run(env(kv));
+    await run(env(kv));
+    expect(smsCalls(calls)).toHaveLength(1);
+    expect(smsBody(smsCalls(calls)[0])).toContain("unreachable");
+  });
+});
+
 describe("DOWN alert wording", () => {
   // Regression guard, not new behaviour: rev 1 of the hardening design wanted
   // 4xx to read as UP and that was rejected — a WAF 403 to everyone is an

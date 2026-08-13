@@ -254,6 +254,21 @@ async function checkReachable(url: string): Promise<Probe> {
     const resp = await fetch(target, {
       method: "GET",
       headers: { "User-Agent": USER_AGENT },
+      // A Worker subrequest reads through a Cloudflare cache even for a
+      // DNS-only hostname, because the name still belongs to a Cloudflare
+      // zone. `_cb` makes a HIT unlikely; this makes it impossible.
+      // (Default since compatibility_date 2024-11-11; an unsupported value
+      // throws rather than being ignored, so this cannot fail silently.)
+      cache: "no-store",
+      // `follow` scores the FINAL response; `manual` scores the FIRST HOP, and
+      // a 3xx counts as up because the origin answered. That is the question
+      // foghorn asks — but it IS quieter than `follow` for "origin is up and
+      // pointing at a corpse": a 3xx to a dead target, or a redirect loop, now
+      // reads up where following would have paged. Deliberate, and a no-op on
+      // the deployed URL (cds1 answers 200, not a redirect). See spec §6 for
+      // the full matrix; if a checked host starts redirecting, add its target
+      // as its own CHECK_URLS entry rather than restoring `follow`.
+      redirect: "manual",
       signal: AbortSignal.timeout(CHECK_TIMEOUT_MS),
     });
     // 2xx/3xx = the server responded; 4xx/5xx or a thrown error = down

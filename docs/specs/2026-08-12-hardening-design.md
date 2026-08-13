@@ -1,6 +1,11 @@
 # Foghorn hardening: make the dead-man alarm harder to fool
 
-**Status:** design, **rev 2** — rev 1 reviewed by four adversarial passes
+**Status:** **rev 3** — steps 1–4 BUILT AND DEPLOYED across five gate rounds;
+step 5 run as an experiment and its outcome CANCELLED it and deferred step 6.
+Read §0.5 first: it corrects rev 2's central premise about §2.2. Below is rev 2
+as reviewed, preserved so the corrections are legible against it.
+
+Rev 2 status — rev 1 reviewed by four adversarial passes
 (grok-4.6 and grok-4.5, each under a correctness and a safety lens; all four
 EXECUTE-WITH-FIXES). Four Blockers, and several were errors in rev 1's claims
 about swatter's code. See `2026-08-12-hardening-design-review-grok.md`.
@@ -8,6 +13,51 @@ about swatter's code. See `2026-08-12-hardening-design-review-grok.md`.
 **Origin:** scoped out of `swatter`'s
 `docs/superpowers/specs/2026-08-12-outage-corroboration-design.md` §5, after two
 adversarial reviews cut half of what was originally proposed there.
+
+## §0.5 REV 3 AMENDMENT — §2.2's premise is wrong for the URL we actually watch
+
+**Settled empirically 2026-08-12, which is what §5 step 5 existed to do. The
+answer was "do not write the code."**
+
+`cds1.peaceharborhosting.com` is **DNS-only (grey cloud)**. It resolves to
+`67.225.133.76` — the origin, and the same address as the operator's SSH host —
+which is in no range published at `cloudflare.com/ips-v4`. The zone *is* on
+Cloudflare (`lucy`/`paul.ns.cloudflare.com`), so this is a per-record grey
+cloud, not a zone that left. Two adversarial falsification passes closed every
+alternative: BYOIP, Magic Transit, `enforce_dns_only`, an orange A/AAAA sibling,
+a CNAME landing on a proxied name, Spectrum. Both authoritative nameservers and
+three public resolvers agree, TTL 300. A non-Cloudflare client TCP-handshakes
+that Liquid Web address and then dies in TLS — origin-lock, not an edge.
+
+**So there is no Cloudflare edge in front of cds1.** Always Online,
+`stale-if-error` and Cache-Everything cannot serve a page over a dead origin on
+this hostname, because they only ever fire on proxy-generated 520–527. Foghorn
+has been probing the origin directly all along.
+
+Consequences:
+
+- **§2.2's second fix and §5 step 5 are CANCELLED.** The `resolveOverride`
+  experiment, the `origin.cds1.…` grey-cloud hostname, and §7 question 2 all
+  die with it. Question 2 was moot regardless: `cds1` already publishes the
+  origin IP. Cloudflare's own docs settle the mechanism anyway —
+  `resolveOverride` "will only take effect if both the URL host and the host
+  specified by `resolveOverride` are within your zone" and is otherwise
+  "ignored for security reasons", and a cron-only Worker has no zone at all.
+- **§2.2's first fix (`CF-Cache-Status`) is DEFERRED, not cancelled.** A Worker
+  subrequest reads through a Cloudflare cache *even for a DNS-only hostname*,
+  because the name still belongs to a Cloudflare zone. The header can still
+  appear. Build it if the trigger below fires.
+- **DONE INSTEAD — the two cheap levers rev 2 listed and never sequenced.**
+  `cache: "no-store"` and `redirect: "manual"` on the probe. `no-store` closes
+  the subrequest-cache residual outright. `redirect: "manual"` is narrower than
+  it looks: it stops foghorn scoring a *different host's* response as though it
+  were the origin's, but it does **not** rescue the orange-apex case — an edge
+  301 is a 3xx and still reads up. It also trades one quiet failure for another;
+  the matrix is in §6. Neither lever substitutes for the DNS-only policy.
+
+**TRIGGER THAT REOPENS ALL OF THIS:** every host in `CHECK_URLS` must be
+DNS-only. Point it at a proxied host and §2.2 becomes live again immediately.
+This is not hypothetical — see the amendment to §3 below.
 
 ## §0. What foghorn is, and what it actually does today
 
@@ -227,6 +277,28 @@ opt-in per URL and default off.
 
 ## §3. Explicitly NOT doing: watching customer sites on the SMS path
 
+**REV 3 AMENDMENT — this section has a hole, and it is live.** It forbids
+*customer* vhosts. It says nothing about the operator's **own** proxied
+properties, and those are the §2.2 trap sitting one hostname away:
+`peaceharborhosting.com` and `www` are orange and **301 at the edge** to
+`hosting.peaceharbor.com`, which is also orange and already serves
+`cf-cache-status: REVALIDATED`. `CHECK_URLS` is a comma-separated list. One
+edit to "also check the public homepage" puts foghorn on a name the edge can
+answer while cds1 is dead — and `redirect: "follow"`, the fetch default, turns
+that 301 into a final 200.
+
+**`redirect: "manual"` does NOT close this.** An earlier draft of this paragraph
+claimed it did; that was wrong and a reviewer caught it. The edge 301 is a 3xx,
+`checkReachable` counts any 3xx as up, and the result is the same silent UP. The
+deferred `CF-Cache-Status` check would not catch it either — that 301 carries no
+such header, and §2.2 specifies fail-open on a missing value.
+
+**The only thing that closes it is the policy: every `CHECK_URLS` host stays
+DNS-only.** That rule is not enforced in code, so it lives or dies by being
+read. If enforcement is ever wanted, the cheap version is to flag a probe
+response carrying `cf-ray` — that means the host is proxied and §2.2 is live —
+which is a far smaller change than the full cache-status table.
+
 The original §5 proposed pointing `CHECK_URLS` at three or four customer vhosts.
 Cut, for two reasons:
 
@@ -276,11 +348,11 @@ and the origin-probe **experiment** precedes any code that depends on its outcom
 3. **§2.1 heartbeat**, to the contract spelled out above — the largest reduction
    in missed-page risk. Must include a test that a **DOWN** run still pings.
 4. **§2.1 synthetic send**, so notifier credential rot cannot stay invisible.
-5. **The origin-probe experiment.** Settle by experiment, before writing code,
-   whether `resolveOverride` does anything at all for a cron-only Worker, and
-   whether a grey-cloud hostname with a valid cert is reachable and origin-lock
-   accepts it. Only then write §2.2.
-6. **§2.2 cache-status assertion**, fail-open, with the corrected table.
+5. ~~**The origin-probe experiment.**~~ **DONE 2026-08-12, outcome: CANCELLED.**
+   cds1 is DNS-only, so there is no edge to probe around. See §0.5.
+6. ~~**§2.2 cache-status assertion**~~ **DEFERRED** — fail-open, corrected
+   table, build only if a `CHECK_URLS` host is ever proxied. The cheap levers
+   (`cache: "no-store"`, `redirect: "manual"`) shipped instead. See §0.5.
 7. **§2.6 content assertion**, opt-in, default off.
 8. **§2.1(2) swatter-side cross-check** — nightly assertion that foghorn probed at
    least N times. This is work in the *swatter* repo, not this one; rev 1 listed it
@@ -312,8 +384,27 @@ claim that holds.
 - **A JS challenge or Bot Fight response is a 403 to a Worker**, which does not run
   challenge JavaScript. Under Attack mode therefore reads as DOWN, correctly by
   §2.4's rule but for a reason the operator must recognise from the wording.
-- **`redirect: "follow"` is the fetch default**, so a 302 onto an Always-Online or
-  error property can become a final 200 and read as healthy.
+- ~~**`redirect: "follow"` is the fetch default**~~ — **changed to `manual`
+  2026-08-12, which trades one quiet failure for another. Recorded as
+  deliberate, per review.** `follow` scored the FINAL response; `manual` scores
+  the FIRST HOP, and any 3xx counts as up. So these now read UP where they
+  previously paged:
+
+  | First hop | Old (`follow`) | New (`manual`) |
+  |---|---|---|
+  | 3xx to a host that times out, refuses, or 4xx/5xx | DOWN | **UP, silent** |
+  | Redirect loop | DOWN (fetch throws) | **UP, silent** |
+  | 3xx onto a cached/Always-Online property | UP (followed 200) | UP (the 3xx) |
+  | Connection/TLS/timeout on the first hop | DOWN | DOWN |
+  | 4xx / 5xx on the first hop | DOWN | DOWN |
+
+  The trade is intentional. Foghorn asks *"did this origin answer?"*, and a 3xx
+  is an answer; `follow` was an accidental deeper check on whether the redirect
+  TARGET was alive. **It is a no-op on the deployed URL** — cds1 answers 200
+  (`access_log`: `"GET /?_cb=… HTTP/2.0" 200 163`), so there is no first-hop
+  redirect to score. It becomes live the moment a `CHECK_URLS` host starts
+  redirecting, and at that point the right fix is to check the redirect target
+  as its own `CHECK_URLS` entry rather than to restore `follow`.
 - **An empty `CHECK_URLS` returns without throwing** (`:43-46`) — foghorn watching
   nothing looks exactly like foghorn watching a healthy server, which is why the
   heartbeat must not ping on that path.
