@@ -1,6 +1,6 @@
 # Handoff — foghorn hardening, steps 1–4 shipped (2026-08-12)
 
-**Repo:** `foghorn` · **Worker:** `down-detector`, version `39ae04a7`, **DEPLOYED**.
+**Repo:** `foghorn` · **Worker:** `down-detector`, version `fe6c3d00`, **DEPLOYED**.
 **Status:** steps 1–4 of the sequencing below are built, reviewed across five
 gate rounds, and live. Steps 5–8 are untouched. 53 tests, typecheck clean.
 
@@ -77,8 +77,10 @@ healthy path can read as broken for a while. Every torn state was enumerated in
 round 5 — worst case is a surplus text or a delayed re-proof, never a missed
 origin page.
 
-**`SYNTHETIC_TEST_DAYS` is still off** — that is §7 question 4, and it is the
-operator's call, not a blocked task.
+**`SYNTHETIC_TEST_DAYS` is ON at 30 days** (2026-08-12) and the first text was
+received, so the Twilio path is proven end to end — the one thing the heartbeat
+can never tell you. Production runs Twilio only, so the "several notifiers means
+it only proves ONE path" caveat does not currently bite.
 
 ## Also open
 
@@ -227,5 +229,5 @@ gate D should use the corrected reasoning.
    That is already inferable, and origin-lock is the actual defence, but it is a
    deliberate exposure and belongs to the operator, not to me.
 3. **Free plan or paid?** It decides whether §2.5's state endpoint is ever revived.
-4. **Is a monthly synthetic SMS acceptable noise** for proving the delivery path
-   still works? It costs pennies and one text a month.
+4. ~~**Is a monthly synthetic SMS acceptable noise**~~ — **ANSWERED 2026-08-12:
+   yes, enabled at 30 days** and confirmed delivering.
