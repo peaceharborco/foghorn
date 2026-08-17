@@ -159,7 +159,7 @@ healthy, and unproven. KV state at time of writing: `{"status":"up","fails":0}`.
 
 Evidence that no rescue has occurred, with its limits stated:
 
-- No post-deploy run exceeds **2,519 ms**, far below the ~11 s a timeout-then-rescue would take.
+- No post-deploy run exceeds **2,519 ms**, far below the ~13 s a timeout-then-rescue would take.
 - A query for log messages containing `retry` returned empty — but **this is weak**: no console
   output of any kind appears in that dataset for the whole window, so it was never confirmed that
   `console.warn` is indexed there at all.
@@ -172,7 +172,8 @@ Evidence that no rescue has occurred, with its limits stated:
    retry`. First confirm that filter can see console output at all — emit a test log if needed,
    because an empty result currently proves nothing.
    Wall-time signatures, with the caveat that they only cover the timeout subclass:
-   - timeout → rescue: ~11–12 s.
+   - timeout → rescue: **~13–14 s**. Not 11 s: 10 s abort + 1 s backoff is only the floor, and the
+     run still does everything a healthy run does (1.2–2.6 s here) on top of it.
    - timeout → retry also fails, and it pages: **~22 s** in practice — the probe pair is 21 s and
      notify plus heartbeat are normally sub-second. **Do not filter for 36 s.** That figure is the
      worst-case *budget* (both notify and heartbeat hanging to their own timeouts) and is what the
