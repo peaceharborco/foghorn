@@ -7,6 +7,12 @@
   // Change this only if you intend to run a DIFFERENT Worker: deploying under
   // a new name creates a second one, and the first keeps running its own cron.
   "name": "down-detector",
+  // Only needed when your API token can see more than one Cloudflare account.
+  // Wrangler cannot choose for you in non-interactive mode, so `wrangler deploy`
+  // fails with "More than one account available" until you set this. It is not
+  // a secret; find it in any dashboard URL, or run `wrangler whoami`. Leave it
+  // commented out if your token sees exactly one account.
+  // "account_id": "0123456789abcdef0123456789abcdef",
   "main": "src/index.ts",
   "compatibility_date": "2026-05-01",
   "observability": { "enabled": true },
