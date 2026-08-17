@@ -17,10 +17,12 @@ A text does.
 ## How it works
 
 Every minute, Cloudflare's cron fires the Worker. It fetches each URL you're
-watching (cache-busted, so it always hits the origin). After `FAIL_THRESHOLD`
-consecutive failures it sends **one** DOWN alert; on recovery, **one** UP alert.
-Exactly one message per transition — a server that's down for six hours costs
-you two texts, not 360.
+watching (cache-busted, so it always hits the origin). A probe that fails in
+transit is retried once inside the same run, so a blip that clears within a
+second never starts a streak. After `FAIL_THRESHOLD` consecutive failed checks
+it sends **one** DOWN alert; on recovery, **one** UP alert. Exactly one message
+per transition — a server that's down for six hours costs you two texts, not
+360.
 
 State lives in Workers KV and is written **only when something changes**. A
 healthy server does *zero* KV writes — which matters, because Cloudflare's free
@@ -79,7 +81,7 @@ All plain vars in `wrangler.jsonc` (secrets via `wrangler secret put`):
 | Var | Required | What it does |
 |---|---|---|
 | `CHECK_URLS` | yes | One or more URLs, comma-separated. Each gets its own failure streak and its own alerts. (`CHECK_URL` also accepted.) |
-| `FAIL_THRESHOLD` | no | Consecutive failed checks before a DOWN alert. Default `2` — with a 1-minute cron, that's ~2 minutes of confirmed downtime before your phone buzzes. |
+| `FAIL_THRESHOLD` | no | Consecutive failed **checks** before a DOWN alert, counted at the cron interval. A check is one probe, plus a second attempt when the first failed in transit. Default `2`; on a 1-minute cron that is two consecutive failed minutes. See below for what that does and does not buy. |
 | `TWILIO_FROM` / `TWILIO_TO` | for SMS | Your Twilio number and where to text. Also needs the `TWILIO_ACCOUNT_SID` and `TWILIO_AUTH_TOKEN` secrets. |
 | `WEBHOOK_URL` | for webhook | Any Slack/Discord-compatible webhook endpoint. |
 | `HEARTBEAT_URL` | no (**secret**) | Dead-man ping URL from healthchecks.io or equivalent, pinged on each run that foghorn could actually page you (see below). This is what raises the alarm when *foghorn itself* dies. A capability URL — use `wrangler secret put`, not a var. |
@@ -87,12 +89,74 @@ All plain vars in `wrangler.jsonc` (secrets via `wrangler secret put`):
 | `DELIVERY_PING_URL` | no (**secret**) | A **second** dead-man check, watching the delivery test alone. Pinged when the test passes, `/fail` when it fails — so notifier rot pages you instead of only reaching a log. Set its period to the test interval, not a minute. |
 | `EXPECT_TEXT` / `FORBID_TEXT` | no | Assert on the page body of a 2xx: page if the expected text is missing, or the forbidden text appears. Off unless set, and the body is not read otherwise. Applies to **every** URL in `CHECK_URLS` — see below before using it with more than one. |
 
-A check counts as **up** on any 2xx/3xx response. A 4xx, a 5xx, a timeout
-(10s), or a refused connection all count as **down** — if your homepage starts
+A probe counts as **up** on any 2xx/3xx response. A 4xx, a 5xx, a timeout
+(10s each), or a refused connection all count as **down** — if your homepage starts
 throwing 500s, that's an outage, whatever the TCP handshake thinks. The alert
 says which kind of dead it is: *unreachable* when nothing answered, *answered
 HTTP 403* when the origin is up but refusing (a WAF rule, a challenge, or a
 check URL that's simply wrong).
+
+What gets retried is a probe where the origin **never finished answering** — a
+timeout, a refused connection, a DNS failure, or — when a content assertion is
+switched on, since the body is not read otherwise — a body that stopped
+arriving before it could be checked. A page that arrived in full is telling you
+something real, so a 500,
+or a whole page genuinely missing its `EXPECT_TEXT`, is not retried; that would
+only delay a true page. The retry costs one extra request, and only on a minute
+that already failed; healthy runs are unchanged.
+
+Two consequences worth knowing. Detection of a **hard** outage is unchanged —
+still `FAIL_THRESHOLD` failed minutes — but a failure *in transit* now means a
+failed **pair**, so an origin that answers roughly one probe in two (a flapping
+load balancer, a box that is overloaded rather than dead) stays quiet longer
+than it used to. An origin that answers `500` is unaffected: that is a
+definitive answer, it is never retried, and one of them still fails the minute
+outright. The retry buys fewer false pages at the price of being slower to page
+a *degraded* origin.
+
+And a minute in which every URL fails *in transit* now costs two probes per URL
+— a minute of 4xx or 5xx still costs one, since those are never retried.
+Against the free tier's 50-subrequests-per-invocation budget the worst
+case is two probes per URL, one notifier call per URL crossing the threshold
+per notifier configured, plus the heartbeat ping. With a single notifier that is
+**3N + 1**, which first exceeds 50 at seventeen URLs; with both Twilio and a
+webhook it is **4N + 1**, which exceeds it at thirteen. Stay a few short of
+whichever applies. (The delivery test is not in that count: it only runs on a
+completely clean run, so it never coincides with an outage.) Past the cliff a
+broad outage exhausts the budget part-way through the run: the probes fit, the
+notifier calls queued behind them do not. The heartbeat ping is issued last, so
+it is the one that gets dropped — reporting foghorn dead on top of a correct
+DOWN alert.
+
+### What `FAIL_THRESHOLD` actually buys
+
+It is `N` consecutive failed **checks, at the cron interval** — not `N` seconds,
+and not `N` requests. On the default 1-minute cron, `2` means two consecutive
+minutes in which the check failed.
+
+How many requests that took depends on *how* it failed. An origin answering
+`500` costs one request per minute, because a definitive answer is never
+retried. A path failing in transit costs two, because the retry has to fail as
+well. So `2` is somewhere between two and four failed requests, across two cron
+ticks either way.
+
+That distinction is the whole reason this project has a
+`docs/handoff-2026-08-17-false-down-probe-blips.md`. `2` used to mean two single
+probes, and the README used to sell it as "~2 minutes of confirmed downtime" —
+wording that quietly assumed probe failures are rare **and independent**.
+Measured over 6,550 probes against a healthy origin they were neither rare
+enough nor evenly spread. For most of that window the base rate was about one
+miss a day; on the day of the false page there were 17, arriving in clusters
+(five inside 25 minutes, four inside 21, five inside 22). Under clustering,
+"two in a row" stops being a remote coincidence, and foghorn texted that a
+server was down when it never was.
+
+The retry is what makes `2` honest again for that class, because there it is the
+*pair* that has to fail. Raise it to `3` if you are running a longer cron interval — the retry's
+protection is per-check, so a 5-minute cron gets far fewer of them — or if you
+know the path to your origin is noisy. Every step costs one more cron interval
+of detection latency on a real outage, which is the only thing you are buying
+with it.
 
 ### Who watches the watchman
 
@@ -156,8 +220,15 @@ the original, and a quiet miss is worse than a loud false page.
 The body is scanned as a stream with a sliding window sized to the search
 string, decoded in small slices, so peak memory is bounded by that slice rather
 than by the page: there is no size limit, and no limit for a match to hide past. If the body dies mid-scan
-it pages rather than assuming the page was clean — an absence you cannot prove
-is a miss.
+before it can prove what it was looking for, the probe fails rather than
+assuming the page was clean — an absence you cannot prove is a miss. Only an
+absence, though: a needle that already appeared in the part which did arrive is
+proof either way. `EXPECT_TEXT` found, with no `FORBID_TEXT` set, passes; a
+`FORBID_TEXT` needle found fails outright, whether or not the rest arrived.
+
+The unprovable case counts as **transport**, not as a wrong page, because the
+origin never finished answering: it is retried once like any other, and a body
+that truncates on both attempts is what reaches the streak.
 
 ## What this deliberately is not
 

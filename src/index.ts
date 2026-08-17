@@ -2,15 +2,21 @@
  * Foghorn — Cloudflare Worker (cron-triggered)
  *
  * Every minute, checks whether each configured URL is reachable from outside.
- * After FAIL_THRESHOLD consecutive failed checks it sends one alert; on
- * recovery it sends one more. Exactly one alert per transition — no spam.
+ * A probe that fails in transit is retried once inside the run, so a blip that
+ * clears within a second is not a failure. After FAIL_THRESHOLD consecutive failed checks it sends one
+ * alert; on recovery it sends one more. Exactly one alert per transition — no
+ * spam.
  *
  * State lives in KV and is written ONLY when it changes, so a healthy
  * server costs zero KV writes (Cloudflare's free KV write quota is tight).
  *
  * Config (wrangler.jsonc vars):
  *   CHECK_URLS      one or more URLs, comma-separated (CHECK_URL also accepted)
- *   FAIL_THRESHOLD  consecutive failures before a DOWN alert (default 2)
+ *   FAIL_THRESHOLD  consecutive failed CHECKS before a DOWN alert, counted at
+ *                   the cron interval. A check is one probe, plus a second
+ *                   attempt when the first failed in transit — so on a
+ *                   1-minute cron the default 2 is two failed minutes, which
+ *                   is two to four failed requests depending on how it failed.
  *   TWILIO_FROM / TWILIO_TO   SMS notifier (needs the two secrets below)
  *   WEBHOOK_URL     generic webhook notifier — payload carries both "text"
  *                   and "content", so Slack and Discord URLs work as-is
@@ -93,6 +99,15 @@ interface Synthetic {
 }
 
 const CHECK_TIMEOUT_MS = 10_000;
+// Pause between a probe and its retry. Long enough to be a genuinely separate
+// attempt rather than the same instant twice; short enough that a worst-case
+// run (probe + backoff + retry + notify + heartbeat) still lands inside the
+// 60s cron with the heartbeat reached.
+const RETRY_BACKOFF_MS = 1_000;
+// The one content verdict that is really a transport failure wearing a content
+// label: the body stream broke, so the origin never finished answering. The
+// other two mean the page itself was wrong, which is a real answer.
+const UNREADABLE_PAGE = "unreadable page";
 const HEARTBEAT_TIMEOUT_MS = 5_000;
 // Waiting on fetch is not CPU time, so an unbounded notifier call can sit for
 // the whole 15-minute cron wall clock and eat the heartbeat ping with it.
@@ -254,21 +269,67 @@ async function saveState(env: Env, url: string, state: State): Promise<void> {
   await env.STATE.put(stateKey(url), JSON.stringify(state));
 }
 
+/**
+ * One probe of the URL, retried once when the origin never finished answering.
+ *
+ * A probe that fails in transit is one observation, not a confirmed outage.
+ * Retrying inside the run is what keeps that distinction: the pair resolves to
+ * a single `Probe`, so the caller increments `fails` once and writes KV once —
+ * structurally, not by remembering to.
+ */
 async function checkReachable(env: Env, url: string): Promise<Probe> {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    // A malformed CHECK_URLS entry. Not transient, and no amount of retrying
+    // will make it parse, so this never reaches the second attempt.
+    return { ok: false };
+  }
+  const first = await probeOnce(env, parsed);
+  if (!isTransient(first)) return first;
+  await sleep(RETRY_BACKOFF_MS);
+  const second = await probeOnce(env, parsed);
+  // One line per rescue. Without it, measuring how often this fires means
+  // reading the watched host's access log — which foghorn generally cannot,
+  // and which is the only reason the original diagnosis was possible at all.
+  // A retry that also failed needs no line: it becomes a streak, and the
+  // streak is what pages.
+  if (second.ok) {
+    console.warn(`Foghorn: probe of ${parsed.host} failed in transit, succeeded on retry.`);
+  }
+  return second;
+}
+
+/**
+ * Whether a failed probe is worth a second attempt: the origin never finished
+ * answering. A page that arrived in full is telling you something real, and
+ * retrying a real answer only delays a true page.
+ */
+function isTransient(probe: Probe): boolean {
+  if (probe.ok) return false;
+  // A body that stopped arriving mid-read. It carries the 200 the origin did
+  // manage to send, so the status test below would not catch it.
+  if (probe.contentFail === UNREADABLE_PAGE) return true;
+  // Nothing came back at all: DNS, connection refused, or the abort timeout.
+  return probe.status === undefined;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function probeOnce(env: Env, url: URL): Promise<Probe> {
   // Cache-bust so the check always hits the origin, never a cached subrequest.
   // Via searchParams, not concatenation: appending to a URL carrying a
   // fragment puts `_cb` after the "#", where fetch strips it and the request
   // can be answered from cache — exactly what the buster exists to prevent.
-  let target: string;
+  // Copied per attempt, so the retry carries its own buster and cannot be
+  // answered from anything the first attempt might have populated.
+  const target = new URL(url);
+  target.searchParams.set("_cb", String(Date.now()));
   try {
-    const parsed = new URL(url);
-    parsed.searchParams.set("_cb", String(Date.now()));
-    target = parsed.toString();
-  } catch {
-    return { ok: false };
-  }
-  try {
-    const resp = await fetch(target, {
+    const resp = await fetch(target.toString(), {
       method: "GET",
       headers: { "User-Agent": USER_AGENT },
       // A Worker subrequest reads through a Cloudflare cache even for a
@@ -307,17 +368,31 @@ async function checkReachable(env: Env, url: string): Promise<Probe> {
       // quiet miss, so it asserts on all of them and the docs say so.
       const needles = [expected, forbidden].filter((n): n is string => Boolean(n));
       const { found, complete } = await scanBody(resp, needles);
-      if (expected && !found.has(expected)) {
-        return { ok: false, status: resp.status, contentFail: "missing text" };
-      }
+      // A needle that WAS seen is proof, finished scan or not.
       if (forbidden && found.has(forbidden)) {
         return { ok: false, status: resp.status, contentFail: "forbidden text" };
       }
-      // Absence only counts if the whole body was actually scanned. A stream
-      // that died mid-page cannot prove the forbidden string is not there, and
-      // an unprovable absence is a miss — so fail closed.
-      if (forbidden && !complete) {
-        return { ok: false, status: resp.status, contentFail: "unreadable page" };
+      // Every remaining verdict turns on something NOT being there, and a
+      // stream that died mid-page cannot prove an absence — so fail closed.
+      // It fails closed as a TRANSPORT failure, because the origin never
+      // finished answering, and that is also what gets it retried.
+      //
+      // Fires while an unproven absence remains: the expected needle was not
+      // seen, or FORBID_TEXT is configured at all (a scan that stopped early
+      // can never prove a forbidden string is absent). The two ways out are
+      // both proofs — a forbidden needle already seen returned above, and an
+      // expected needle already seen with no FORBID_TEXT falls through to ok —
+      // because presence is proof whether or not the scan finished.
+      //
+      // What EXPECT_TEXT and FORBID_TEXT must NOT do is disagree here: the
+      // identical broken stream used to read "unreadable page" under one and
+      // "missing text" under the other, so the same event was retried under
+      // one and paged under the other.
+      if (!complete && ((expected && !found.has(expected)) || forbidden)) {
+        return { ok: false, status: resp.status, contentFail: UNREADABLE_PAGE };
+      }
+      if (expected && !found.has(expected)) {
+        return { ok: false, status: resp.status, contentFail: "missing text" };
       }
     }
     return { ok: true, status: resp.status };
@@ -410,6 +485,15 @@ function smsHost(host: string): string {
 function downMessage(rawHost: string, probe: Probe, fails: number): string {
   const host = smsHost(rawHost);
   const tail = `${fails} consecutive fails.`;
+  // Distinct from the content verdicts below: this one is the connection
+  // failing, not the page being wrong. Saying "content is wrong" would send
+  // the operator to inspect a body that was never delivered.
+  if (probe.contentFail === UNREADABLE_PAGE) {
+    return (
+      `Foghorn: ${host} appears DOWN - answered HTTP ${probe.status} ` +
+      `but the body did not finish arriving, ${tail}`
+    );
+  }
   if (probe.contentFail) {
     return (
       `Foghorn: ${host} appears DOWN - answered HTTP ${probe.status} ` +

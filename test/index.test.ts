@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import worker from "../src/index";
 
 type FetchCall = { url: string; init?: RequestInit };
@@ -49,6 +49,67 @@ function stubFetch(
   return calls;
 }
 
+/**
+ * Stubs fetch so the first `n` probes of `url` fail and every later one
+ * succeeds — the shape of the blip that produced the false page. Everything
+ * else (Twilio, webhooks, pings) returns 200.
+ */
+function stubFlakyProbe(
+  url: string,
+  n: number,
+  failure: number | "throw" = "throw",
+): FetchCall[] {
+  const calls: FetchCall[] = [];
+  let failed = 0;
+  vi.stubGlobal("fetch", async (u: string | URL, init?: RequestInit) => {
+    const s = String(u);
+    calls.push({ url: s, init });
+    if (s.startsWith(url) && failed < n) {
+      failed++;
+      if (failure === "throw") throw new TypeError("fetch failed");
+      return new Response("err", { status: failure });
+    }
+    return new Response("ok", { status: 200 });
+  });
+  return calls;
+}
+
+/** A 200 whose body starts arriving and then dies mid-stream. */
+function brokenStream(): Response {
+  return new Response(
+    new ReadableStream({
+      start(c) {
+        c.enqueue(new TextEncoder().encode("partial"));
+        c.error(new Error("stream died"));
+      },
+    }),
+    { status: 200 },
+  );
+}
+
+/**
+ * Stubs fetch so the first probe of `url` answers 200 with a body that dies
+ * mid-stream, and every later one answers 200 with `body`.
+ */
+function stubBrokenThenWhole(url: string, body: string): FetchCall[] {
+  const calls: FetchCall[] = [];
+  let first = true;
+  vi.stubGlobal("fetch", async (u: string | URL, init?: RequestInit) => {
+    const s = String(u);
+    calls.push({ url: s, init });
+    if (s.startsWith(url) && first) {
+      first = false;
+      return brokenStream();
+    }
+    return new Response(body, { status: 200 });
+  });
+  return calls;
+}
+
+/** Probe requests only — Twilio, webhook and dead-man pings filtered out. */
+const probeCalls = (calls: FetchCall[], url = "https://a.example") =>
+  calls.filter((c) => c.url.startsWith(url));
+
 function env(kv: FakeKV, overrides: Record<string, unknown> = {}) {
   return {
     STATE: kv,
@@ -72,6 +133,21 @@ const smsCalls = (calls: FetchCall[]) =>
 const smsBody = (c: FetchCall) =>
   new URLSearchParams(String(c.init?.body ?? "")).get("Body") ?? "";
 
+/**
+ * Collapses the retry backoff. Production waits RETRY_BACKOFF_MS between the
+ * two probe attempts; on real timers that would add seconds to every
+ * transport-failure test in this file and buy no coverage.
+ */
+const backoffDelays: number[] = [];
+beforeEach(() => {
+  backoffDelays.length = 0;
+  vi.stubGlobal("setTimeout", (fn: () => void, ms?: number) => {
+    backoffDelays.push(ms ?? 0);
+    fn();
+    return 0 as unknown as ReturnType<typeof setTimeout>;
+  });
+});
+
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
@@ -89,6 +165,30 @@ async function downAlertBody(
   const kv = fakeKV();
   const calls = stubFetch(new Set([url]), failure);
   const e = env(kv, { CHECK_URLS: url });
+  await run(e);
+  await run(e);
+  const sms = smsCalls(calls);
+  expect(sms).toHaveLength(1);
+  return smsBody(sms[0]);
+}
+
+/**
+ * Drives a URL whose body ALWAYS truncates to the DOWN threshold and returns
+ * the one alert body. The single-alert assertion inside is itself the
+ * fail-closed guard: an unprovable page must never be rescued into an UP.
+ */
+async function truncatedAlertBody(
+  overrides: Record<string, unknown>,
+  url = "https://a.example",
+): Promise<string> {
+  const kv = fakeKV();
+  const calls: FetchCall[] = [];
+  vi.stubGlobal("fetch", async (u: string | URL, init?: RequestInit) => {
+    const s = String(u);
+    calls.push({ url: s, init });
+    return s.startsWith(url) ? brokenStream() : new Response("ok", { status: 200 });
+  });
+  const e = env(kv, { CHECK_URLS: url, ...overrides });
   await run(e);
   await run(e);
   const sms = smsCalls(calls);
@@ -316,6 +416,195 @@ describe("probing the origin, not the edge", () => {
   });
 });
 
+describe("transient probe failures", () => {
+  // The false page of 2026-08-17: two probes failed in transit on consecutive
+  // minutes and FAIL_THRESHOLD=2 read that as confirmed downtime. A probe now
+  // gets one retry, so a single blip never reaches the streak at all.
+  it("retries a probe that failed in transit rather than counting it", async () => {
+    const kv = fakeKV();
+    const calls = stubFlakyProbe("https://a.example", 1);
+    await run(env(kv));
+    expect(probeCalls(calls)).toHaveLength(2);
+    expect(smsCalls(calls)).toHaveLength(0);
+    expect(kv.writes).toBe(0);
+  });
+
+  // Re-measuring this fix otherwise means reading the watched host's own
+  // access log, which foghorn usually cannot. One line per rescue makes the
+  // blip rate countable from Workers observability alone.
+  it("logs a rescued probe so blips stay countable without the origin log", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const kv = fakeKV();
+    stubFlakyProbe("https://a.example", 1);
+    await run(env(kv));
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0][0])).toContain("a.example");
+  });
+
+  it("stays quiet on a healthy probe", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const kv = fakeKV();
+    stubFetch();
+    await run(env(kv));
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  // The delay is collapsed above so the suite stays fast, but the value the
+  // production code ASKS for is still pinned here — otherwise raising the
+  // backoff would leave every test green while the run quietly outgrew its
+  // cron minute. It does NOT pin the number of attempts: this fixture succeeds
+  // on the retry, so a further attempt would never run. The probe counts in
+  // the tests below are what hold that.
+  it("waits a full second before retrying", async () => {
+    const kv = fakeKV();
+    stubFlakyProbe("https://a.example", 1);
+    await run(env(kv));
+    expect(backoffDelays).toEqual([1000]);
+  });
+
+  it("costs one request on a healthy run", async () => {
+    const kv = fakeKV();
+    const calls = stubFetch();
+    await run(env(kv));
+    expect(probeCalls(calls)).toHaveLength(1);
+  });
+
+  it("gives the retry its own cache-buster", async () => {
+    const kv = fakeKV();
+    let t = 1_700_000_000_000;
+    vi.spyOn(Date, "now").mockImplementation(() => (t += 1000));
+    const calls = stubFlakyProbe("https://a.example", 1);
+    await run(env(kv));
+    const busters = probeCalls(calls).map((c) => new URL(c.url).searchParams.get("_cb"));
+    expect(busters).toHaveLength(2);
+    expect(busters[0]).not.toBeNull();
+    expect(busters[1]).not.toBe(busters[0]);
+  });
+
+  // The doc's first constraint: the pair must resolve to ONE outcome. Two
+  // increments would put a single blip halfway to a page on its own.
+  it("counts a failed pair as one failure and one KV write", async () => {
+    const kv = fakeKV();
+    const calls = stubFetch(new Set(["https://a.example"]), "throw");
+    await run(env(kv));
+    expect(probeCalls(calls)).toHaveLength(2);
+    expect(kv.writes).toBe(1);
+    expect(JSON.parse((await kv.get("state:https://a.example"))!).fails).toBe(1);
+    expect(smsCalls(calls)).toHaveLength(0);
+  });
+
+  // The false page itself: one failed probe on each of two consecutive
+  // minutes used to be a confirmed outage at FAIL_THRESHOLD=2.
+  it("no longer pages for a single blip on consecutive runs", async () => {
+    const kv = fakeKV();
+    const e = env(kv);
+    const first = stubFlakyProbe("https://a.example", 1);
+    await run(e);
+    const second = stubFlakyProbe("https://a.example", 1);
+    await run(e);
+    expect(smsCalls(first)).toHaveLength(0);
+    expect(smsCalls(second)).toHaveLength(0);
+    expect(kv.writes).toBe(0);
+  });
+
+  // ...and the guard on it: raising the bar must not mute a real outage.
+  it("still pages when every attempt fails on consecutive runs", async () => {
+    const kv = fakeKV();
+    const calls = stubFetch(new Set(["https://a.example"]), "throw");
+    const e = env(kv);
+    await run(e);
+    await run(e);
+    expect(smsCalls(calls)).toHaveLength(1);
+    expect(probeCalls(calls)).toHaveLength(4);
+  });
+
+  // A status is the origin telling you something real. Retrying it only
+  // delays a true page.
+  it.each([403, 500, 503])("does not retry a definitive HTTP %i", async (status) => {
+    const kv = fakeKV();
+    const calls = stubFetch(new Set(["https://a.example"]), status);
+    await run(env(kv));
+    expect(probeCalls(calls)).toHaveLength(1);
+  });
+
+  it("does not retry a page that answered with the wrong content", async () => {
+    const kv = fakeKV();
+    const calls = stubFetch(new Set(), 500, "maintenance mode");
+    await run(env(kv, { FORBID_TEXT: "maintenance" }));
+    expect(probeCalls(calls)).toHaveLength(1);
+  });
+
+  // Ordering, not wall clock: this proves the ping is still reached after a
+  // retried pair, which is the constraint a retry could break by construction.
+  // It does NOT measure the 36s budget — the backoff is collapsed here and the
+  // stubbed fetch ignores AbortSignal, so the budget stays arithmetic.
+  it("still reaches the heartbeat on a run where both attempts failed", async () => {
+    const HB = "https://hc.example/beat";
+    const kv = fakeKV();
+    const calls = stubFetch(new Set(["https://a.example"]), "throw");
+    await run(env(kv, { HEARTBEAT_URL: HB }));
+    expect(probeCalls(calls)).toHaveLength(2);
+    expect(calls.filter((c) => c.url.startsWith(HB))).toHaveLength(1);
+  });
+
+  // A body that dies mid-stream is the transport failing, not the origin
+  // answering — it reaches the caller wearing a content label only because
+  // that is where the scan noticed. The other two content verdicts are the
+  // page genuinely being wrong, and those are not retried.
+  it("retries a page whose body died mid-scan under FORBID_TEXT", async () => {
+    const kv = fakeKV();
+    const calls = stubBrokenThenWhole("https://a.example", "ok");
+    await run(env(kv, { FORBID_TEXT: "maintenance" }));
+    expect(probeCalls(calls)).toHaveLength(2);
+    expect(smsCalls(calls)).toHaveLength(0);
+    expect(kv.writes).toBe(0);
+  });
+
+  // The same physical event as the test above — a 200 whose body stops
+  // arriving — and it must be classified the same way. It was not: the
+  // missing-expected-text verdict is reached first, which called a broken
+  // stream a definitive wrong page and skipped the retry.
+  it("retries a page whose body died mid-scan under EXPECT_TEXT", async () => {
+    const kv = fakeKV();
+    const calls = stubBrokenThenWhole("https://a.example", "welcome home");
+    await run(env(kv, { EXPECT_TEXT: "welcome" }));
+    expect(probeCalls(calls)).toHaveLength(2);
+    expect(smsCalls(calls)).toHaveLength(0);
+    expect(kv.writes).toBe(0);
+  });
+
+  // ...but a page that arrived in full and genuinely lacks the text is the
+  // origin answering, and must NOT be retried.
+  it("does not retry a whole page that is missing the expected text", async () => {
+    const kv = fakeKV();
+    const calls = stubFetch(new Set(), 500, "nothing useful here");
+    await run(env(kv, { EXPECT_TEXT: "welcome" }));
+    expect(probeCalls(calls)).toHaveLength(1);
+  });
+
+  // Fail-closed, both sides: if every attempt truncates, the retry must not
+  // launder an unprovable page into an UP. Two runs, four probes, one page.
+  it.each([
+    ["EXPECT_TEXT", { EXPECT_TEXT: "welcome" }],
+    ["FORBID_TEXT", { FORBID_TEXT: "maintenance" }],
+  ])("still pages when the body truncates on every attempt under %s", async (_n, cfg) => {
+    const kv = fakeKV();
+    const calls: FetchCall[] = [];
+    vi.stubGlobal("fetch", async (u: string | URL, init?: RequestInit) => {
+      const s = String(u);
+      calls.push({ url: s, init });
+      return s.startsWith("https://a.example")
+        ? brokenStream()
+        : new Response("ok", { status: 200 });
+    });
+    const e = env(kv, cfg);
+    await run(e);
+    await run(e);
+    expect(probeCalls(calls)).toHaveLength(4);
+    expect(smsCalls(calls)).toHaveLength(1);
+  });
+});
+
 describe("DOWN alert wording", () => {
   // Regression guard, not new behaviour: rev 1 of the hardening design wanted
   // 4xx to read as UP and that was rejected — a WAF 403 to everyone is an
@@ -336,6 +625,15 @@ describe("DOWN alert wording", () => {
 
   it("says unreachable when the probe gets no response at all", async () => {
     expect(await downAlertBody("throw")).toContain("unreachable");
+  });
+
+  // A body that stopped arriving is the connection failing, not the page being
+  // wrong. Sending an operator to inspect the content at 3am when the content
+  // was never delivered points them at the wrong system.
+  it("says the body did not finish arriving, not that the content is wrong", async () => {
+    const body = await truncatedAlertBody({ EXPECT_TEXT: "welcome" });
+    expect(body).toContain("did not finish arriving");
+    expect(body).not.toContain("content is wrong");
   });
 });
 
@@ -370,6 +668,8 @@ describe("SMS encoding", () => {
       await downAlertBody(503, prod),
       await upAlertBody(prod),
       await syntheticBody(),
+      await truncatedAlertBody({ EXPECT_TEXT: "welcome" }, prod),
+      await truncatedAlertBody({ FORBID_TEXT: "maintenance" }, prod),
     ];
     for (const body of bodies) {
       expect(outsideGsm7(body)).toEqual([]);
@@ -383,9 +683,16 @@ describe("SMS encoding", () => {
     const long = "https://origin.cds1.peaceharborhosting.com";
     const longer = "https://a-very-long-customer-subdomain.example.co.uk";
     for (const url of [long, longer]) {
-      const body = await downAlertBody(403, url);
-      expect(outsideGsm7(body)).toEqual([]);
-      expect(body.length).toBeLessThanOrEqual(160);
+      // Both the longest wording (the truncated-body arm) and the 403, since
+      // `smsHost` clamps to 43 characters and the arms differ in length.
+      const bodies = [
+        await downAlertBody(403, url),
+        await truncatedAlertBody({ EXPECT_TEXT: "welcome" }, url),
+      ];
+      for (const body of bodies) {
+        expect(outsideGsm7(body)).toEqual([]);
+        expect(body.length).toBeLessThanOrEqual(160);
+      }
     }
   });
 });

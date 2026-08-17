@@ -6,6 +6,26 @@ Hardening, from `docs/specs/2026-08-12-hardening-design.md` steps 1–4. The
 theme: foghorn could previously fail in ways indistinguishable from a healthy
 server, and nothing raised the alarm when the alarm itself died.
 
+- **A probe that fails in transit no longer counts on its own.** It is
+  retried once inside the same run — fresh connection, fresh cache-buster, one
+  second apart — and only counts as a failure if the retry fails too. A
+  definitive answer still counts immediately, as it always did. The pair
+  resolves to one outcome, so it cannot increment the streak twice or write KV
+  twice, and the run still reaches its heartbeat. What gets retried is any
+  failure where the origin never finished answering — a timeout, a refused
+  connection, a DNS failure, or — when a content assertion is switched on — a
+  body that stopped arriving before it could be checked. A 4xx,
+  a 5xx, or a page that arrived in full and was wrong is the origin telling
+  you something real, and is not retried. This closes the false page of 2026-08-17
+  (`docs/handoff-2026-08-17-false-down-probe-blips.md`), where two probes failed
+  in transit on consecutive minutes and `FAIL_THRESHOLD = 2` read that as
+  confirmed downtime. A rescued probe logs one line, so the blip rate stays
+  countable from Workers observability rather than only from the origin's own
+  access log. The README's description of `FAIL_THRESHOLD` was corrected with
+  it: it sold the default `2` as "~2 minutes of confirmed downtime", wording
+  that assumed probe failures are rare *and independent* when the measured ones
+  were clustered. It now says what a threshold actually buys — N consecutive
+  failed checks at the cron interval — and when to raise it.
 - **Something now watches foghorn.** `HEARTBEAT_URL` pings a third-party
   dead-man service on each run where foghorn could actually page you. It stays
   quiet only when it could not — a dead KV binding, no notifier configured, or
