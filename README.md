@@ -203,6 +203,47 @@ working Slack webhook.
 Pick a provider whose delivery path differs from your notifier's, or one Twilio
 outage takes both alarms down at once.
 
+### Reading the log — did it actually page?
+
+Every alert that leaves the building writes one line, so the paging history is
+queryable instead of inferred. Filter your Workers logs for:
+
+```
+Foghorn: paged
+```
+
+You get one line per DOWN, one per UP, and one per synthetic delivery test:
+
+```
+Foghorn: paged DOWN for example.com after 2 failed checks.
+Foghorn: paged UP for example.com.
+Foghorn: paged the scheduled delivery test.
+```
+
+This exists because foghorn used to log only when a send **failed**. A delivered
+page left no trace of its own, so "did it page, and when?" could not be answered
+from the Worker at all — you had to infer it from how long each run took, or go
+read the watched server's own access log, which foghorn usually cannot reach.
+
+Three things worth knowing before you trust it:
+
+- **It means "a notifier accepted this", not "the phone rang".** With Twilio
+  *and* a webhook configured, either one succeeding is enough to write the line.
+  A rotated Twilio token leaves the line standing while only the webhook fired —
+  the adjacent `Twilio send failed` error is what tells them apart.
+- **No notifier configured writes no line.** `notify()` reports whether anything
+  accepted the alert, and that is the only gate; the existing
+  `no notifier configured — dropped alert` error already covers that case, and
+  claiming a page there would be a lie.
+- **Only the host is logged**, never the path or query, so a check URL carrying
+  a token or credentials cannot end up in retained logs. (This does not sanitise
+  the SMS, which is length-clamped but not stripped — the log is the copy that
+  persists and stays queryable.)
+
+The line rides `console.warn`, the same level as the rescued-probe line, so one
+filter shows the whole story of a bad night: which minutes were saved by the
+retry, and which actually woke you.
+
 ### When the page lies
 
 A server can answer `200` and still be broken — a plugin error handler or a
