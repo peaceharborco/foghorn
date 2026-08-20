@@ -141,6 +141,11 @@ const smsBody = (c: FetchCall) =>
 const backoffDelays: number[] = [];
 beforeEach(() => {
   backoffDelays.length = 0;
+  // Every test that drives a transition emits the paging line. Silenced by
+  // default so it does not bury the suite output; the tests that assert on it
+  // re-spy and read the calls, and afterEach restores. This also silences the
+  // rescue warn line, which is asserted the same way where it matters.
+  vi.spyOn(console, "warn").mockImplementation(() => {});
   vi.stubGlobal("setTimeout", (fn: () => void, ms?: number) => {
     backoffDelays.push(ms ?? 0);
     fn();
@@ -702,6 +707,31 @@ describe("synthetic delivery test", () => {
   const enabled = { SYNTHETIC_TEST_DAYS: "30" };
   const synthetic = (calls: FetchCall[]) =>
     smsCalls(calls).filter((c) => /delivery test/i.test(smsBody(c)));
+
+  // The delivery test is the one SMS a healthy production box sends — every 30
+  // days on the deployed config. It called notify() and logged nothing, so the
+  // exact hole this feature closes was still open for it. Deleting the
+  // logPaged call must not leave this suite green.
+  it("logs the scheduled delivery test as a page", async () => {
+    const paged = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const kv = fakeKV();
+    atTime(T0);
+    stubFetch();
+    await run(env(kv, enabled));
+    expect(paged.mock.calls.map((c) => String(c[0]))).toContain(
+      "Foghorn: paged the scheduled delivery test.",
+    );
+  });
+
+  it("does not log the delivery test when the send failed", async () => {
+    const paged = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const kv = fakeKV();
+    atTime(T0);
+    stubFetch(new Set(["https://api.twilio.com"]));
+    await run(env(kv, enabled));
+    expect(paged).not.toHaveBeenCalled();
+  });
 
   it("stays off unless SYNTHETIC_TEST_DAYS is set", async () => {
     atTime(T0);
@@ -1398,5 +1428,220 @@ describe("notifiers", () => {
     await run(e);
     expect(smsCalls(calls)).toHaveLength(1);
     expect(calls.filter((c) => c.url === "https://hooks.example/T/B/x")).toHaveLength(1);
+  });
+});
+
+// Foghorn logged nothing when an alert went OUT — only when a send failed.
+// So "did it page?" could not be answered from Workers observability, and the
+// 2026-08-18 investigation had to infer it from wall-time distributions
+// instead. One line per transition makes the paging history directly
+// queryable. See docs/handoff-2026-08-17-path-latency-and-item-3.md.
+describe("paging is observable", () => {
+  const failing = new Set(["https://a.example"]);
+
+  it("logs a line when a DOWN alert is sent", async () => {
+    const paged = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const kv = fakeKV();
+    stubFetch(failing, 500);
+    const e = env(kv);
+    await run(e);
+    await run(e);
+    expect(paged).toHaveBeenCalledTimes(1);
+    expect(String(paged.mock.calls[0][0])).toContain("a.example");
+    expect(String(paged.mock.calls[0][0])).toContain("DOWN");
+  });
+
+  it("logs a line when an UP alert is sent", async () => {
+    const paged = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const kv = fakeKV();
+    stubFetch(failing, 500);
+    const e = env(kv);
+    await run(e);
+    await run(e);
+    paged.mockClear();
+    stubFetch();
+    await run(e);
+    expect(paged).toHaveBeenCalledTimes(1);
+    expect(String(paged.mock.calls[0][0])).toContain("a.example");
+    expect(String(paged.mock.calls[0][0])).toContain("UP");
+  });
+
+  it("stays quiet on a failure that has not reached the threshold", async () => {
+    const paged = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const kv = fakeKV();
+    stubFetch(failing, 500);
+    await run(env(kv));
+    expect(paged).not.toHaveBeenCalled();
+  });
+
+  it("stays quiet on a healthy run", async () => {
+    const paged = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const kv = fakeKV();
+    stubFetch();
+    await run(env(kv));
+    expect(paged).not.toHaveBeenCalled();
+  });
+
+  // The whole value of the line is that it means "an alert left the building".
+  // Logging one for a send that every notifier rejected would make the
+  // paging history lie in exactly the case an operator most needs it honest.
+  it("does not log a page that no notifier accepted", async () => {
+    const paged = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const kv = fakeKV();
+    stubFetch(new Set(["https://a.example", "https://api.twilio.com"]), 500);
+    const e = env(kv);
+    await run(e).catch(() => {});
+    await run(e).catch(() => {});
+    expect(paged).not.toHaveBeenCalled();
+  });
+
+  // The handoff tells operators to filter Workers logs for exactly this
+  // string. Asserting only "DOWN" and the hostname would let a reworded line
+  // pass while the documented query silently returned nothing.
+  it("emits the documented query string verbatim", async () => {
+    const paged = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const kv = fakeKV();
+    stubFetch(failing, 500);
+    const e = env(kv);
+    await run(e);
+    await run(e);
+    expect(String(paged.mock.calls[0][0])).toMatch(/^Foghorn: paged DOWN for a\.example after 2 failed checks\.$/);
+  });
+
+  it("logs on the first failure when the threshold is 1", async () => {
+    const paged = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const kv = fakeKV();
+    stubFetch(failing, 500);
+    await run(env(kv, { FAIL_THRESHOLD: "1" }));
+    expect(paged).toHaveBeenCalledTimes(1);
+    expect(String(paged.mock.calls[0][0])).toContain("after 1 failed checks");
+  });
+
+  // Already-down runs return before notify(), so they must not re-log either —
+  // otherwise a long outage forges a paging history of one page per minute.
+  it("stays quiet on every run after the first DOWN", async () => {
+    const paged = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const kv = fakeKV();
+    stubFetch(failing, 500);
+    const e = env(kv);
+    await run(e);
+    await run(e);
+    paged.mockClear();
+    await run(e);
+    await run(e);
+    expect(paged).not.toHaveBeenCalled();
+  });
+
+  it("stays quiet when a partial streak recovers below the threshold", async () => {
+    const paged = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const kv = fakeKV();
+    // One failed check, then recovery — fails goes 0 -> 1 -> 0 without ever
+    // reaching the threshold, so notify() is never called on either run.
+    stubFlakyProbe("https://a.example", 1, 500);
+    const e = env(kv);
+    await run(e);
+    await run(e);
+    expect(paged).not.toHaveBeenCalled();
+    expect(await kv.get("state:https://a.example")).toContain('"fails":0');
+  });
+
+  it("logs when the only notifier is a webhook", async () => {
+    const paged = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const kv = fakeKV();
+    stubFetch(failing, 500);
+    const e = env(kv, {
+      TWILIO_ACCOUNT_SID: undefined,
+      TWILIO_AUTH_TOKEN: undefined,
+      TWILIO_FROM: undefined,
+      TWILIO_TO: undefined,
+      WEBHOOK_URL: "https://hooks.example/x",
+    });
+    await run(e);
+    await run(e);
+    expect(paged).toHaveBeenCalledTimes(1);
+    expect(String(paged.mock.calls[0][0])).toContain("DOWN for a.example");
+  });
+
+  it("attributes each line to the URL that paged", async () => {
+    const paged = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const kv = fakeKV();
+    stubFetch(new Set(["https://a.example", "https://b.example"]), 500);
+    const e = env(kv, { CHECK_URLS: "https://a.example, https://b.example" });
+    await run(e);
+    await run(e);
+    // Exact lines, not sort+toContain: a bug that emitted one line naming BOTH
+    // hosts would satisfy a contains-check on each half and still be wrong.
+    const lines = paged.mock.calls.map((c) => String(c[0])).sort();
+    expect(lines).toEqual([
+      "Foghorn: paged DOWN for a.example after 2 failed checks.",
+      "Foghorn: paged DOWN for b.example after 2 failed checks.",
+    ]);
+  });
+
+  // hostOf() falls back to the RAW url when it cannot be parsed. The SMS path
+  // clamps it; this one must not put credentials or a newline into a retained,
+  // queryable log.
+  it("does not dump an unparseable CHECK_URL into the log", async () => {
+    const paged = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const kv = fakeKV();
+    stubFetch();
+    const e = env(kv, { CHECK_URLS: "https://user:hunter2@bad host/x" });
+    await run(e);
+    await run(e);
+    expect(paged).toHaveBeenCalledTimes(1);
+    const line = String(paged.mock.calls[0][0]);
+    expect(line).toContain("(unusable CHECK_URL)");
+    expect(line).not.toContain("hunter2");
+  });
+
+  // A CHECK_URL that PARSES is the shape that actually carries secrets, and
+  // .host is what strips them. Without this, swapping logHost to .href or the
+  // raw string would leak userinfo and query while every other test stayed
+  // green — the unparseable test only pins the throw path.
+  it("logs only the host of a parseable URL carrying credentials and a query", async () => {
+    const paged = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const kv = fakeKV();
+    const url = "https://user:hunter2@a.example:8443/secret?token=abc";
+    stubFetch(new Set([url]), 500);
+    const e = env(kv, { CHECK_URLS: url });
+    await run(e);
+    await run(e);
+    const line = String(paged.mock.calls[0][0]);
+    expect(line).toBe("Foghorn: paged DOWN for a.example:8443 after 2 failed checks.");
+    expect(line).not.toContain("hunter2");
+    expect(line).not.toContain("token");
+    expect(line).not.toContain("secret");
+  });
+
+  // javascript:/file: parse cleanly but have no host, which logged a blank
+  // where the hostname belongs.
+  it("does not log a blank host for a scheme that has none", async () => {
+    const paged = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const kv = fakeKV();
+    stubFetch(new Set(["file:///etc/passwd"]), 500);
+    const e = env(kv, { CHECK_URLS: "file:///etc/passwd" });
+    await run(e);
+    await run(e);
+    expect(String(paged.mock.calls[0][0])).toContain("(unusable CHECK_URL)");
+    expect(String(paged.mock.calls[0][0])).not.toContain("passwd");
+  });
+
+  // notify() does NOT throw when nothing is configured — it logs and returns.
+  // Without a guard the transition would report a page that was only ever
+  // dropped on the floor.
+  it("does not claim a page when no notifier is configured", async () => {
+    const paged = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const kv = fakeKV();
+    stubFetch(failing, 500);
+    const e = env(kv, {
+      TWILIO_ACCOUNT_SID: undefined,
+      TWILIO_AUTH_TOKEN: undefined,
+      TWILIO_FROM: undefined,
+      TWILIO_TO: undefined,
+    });
+    await run(e);
+    await run(e);
+    expect(paged).not.toHaveBeenCalled();
   });
 });

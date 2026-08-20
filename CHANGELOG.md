@@ -37,6 +37,28 @@ server, and nothing raised the alarm when the alarm itself died.
   every N whole days. Success and attempts are tracked separately, so a failure
   neither burns the interval nor passes for proof — it retries hourly until it
   lands. Off unless set, and only ever sent on a completely clean run.
+- **A sent alert now leaves a log line.** foghorn previously logged only when a
+  send *failed*, so a delivered page left no trace of its own and "did it page,
+  and when?" could not be answered from Workers observability at all — the
+  2026-08-18 investigation had to infer it from the wall-clock duration of each
+  run instead (`docs/handoff-2026-08-17-path-latency-and-item-3.md`). Each DOWN
+  and UP transition that a notifier actually accepted now emits one line, so the
+  paging history is directly queryable, and the scheduled delivery test emits
+  one too — the one alert a healthy box sends, which had the same blind spot.
+  `notify()` now reports whether any notifier *accepted* the alert, and that
+  return value is the only gate on the line, so it stays silent when none is
+  configured — where the existing "dropped alert" error already says what
+  happened and claiming a page would be a lie. Read it as "an alert left the
+  building", not "the phone rang": with both Twilio and a webhook configured
+  either one succeeding is enough, and the adjacent "Twilio send failed" error
+  is what tells them apart. Only the host is logged, never the path or query,
+  so a credential-bearing check URL cannot end up in retained logs. Healthy
+  runs are unchanged.
+- **A delivery test that sent nothing no longer counts as proof.** `notify()`
+  returning false — no notifier configured — did not throw, so the synthetic
+  canary fell through to stamping the interval as delivered and pinging
+  `delivery-ok`. It was unreachable in practice, guarded only by a predicate
+  duplicated in another function; it now fails explicitly instead.
 - **Probes identify themselves.** Requests carry a `User-Agent` instead of
   arriving as empty-UA cache-busted traffic every 60 seconds — which is, almost
   exactly, the shape of an abusive scanner.

@@ -186,6 +186,60 @@ export default {
   },
 };
 
+/**
+ * One line per alert that actually went out. Foghorn used to log only when a
+ * send FAILED, which left "did it page?" unanswerable from Workers
+ * observability — the 2026-08-18 investigation had to infer it from wall-time
+ * distributions instead.
+ *
+ * Call this ONLY when notify() returned true. That is the single source of
+ * truth for "a notifier accepted this": notify throws NotifyError when every
+ * configured notifier rejects, and returns false when none was configured at
+ * all. An earlier version re-derived that from hasNotifier(), duplicating
+ * notify's own predicate — two copies of one rule, and the drift would have
+ * failed toward claiming a page that never left.
+ *
+ * "Accepted" is not "the operator read it": with both Twilio and a webhook
+ * configured, notify() returns true if EITHER succeeds, so a rotated Twilio
+ * token can leave this line claiming a page while only the webhook fired. The
+ * adjacent "Twilio send failed" error is what distinguishes the two.
+ */
+function logPaged(what: string): void {
+  // console.WARN, not log, deliberately. Workers observability has only ever
+  // been *observed* carrying warn (the rescue line) and error from this Worker;
+  // no log-level line had ever been emitted, so "log is indexed here" was an
+  // assumption, not a fact. A page nobody can find is the bug this exists to
+  // fix, so it rides the channel already proven to arrive — and lands next to
+  // the rescue line operators already query.
+  console.warn(`Foghorn: paged ${what}.`);
+}
+
+/**
+ * The host, and ONLY the host, safe to put in a retained log.
+ *
+ * hostOf() falls back to the RAW url when it cannot be parsed, which for a
+ * malformed CHECK_URLS entry would dump credentials, a query string, or an
+ * embedded newline into Workers Logs — which are retained and queryable.
+ * `.host` is host:port: userinfo, path and query never survive it.
+ *
+ * Note this does NOT make the SMS safe: smsHost() only length-clamps, so a
+ * short malformed CHECK_URL still reaches the operator's phone intact. That is
+ * pre-existing and out of scope here; the log is the copy that persists.
+ *
+ * A scheme with no host at all (javascript:, file:) parses cleanly and yields
+ * "", which would log a blank where the hostname belongs — so it takes the
+ * sentinel too.
+ */
+function logHost(url: string): string {
+  let host: string;
+  try {
+    host = new URL(url).host;
+  } catch {
+    return "(unusable CHECK_URL)";
+  }
+  return host === "" ? "(unusable CHECK_URL)" : host;
+}
+
 /** Whether any alert could actually leave the building. */
 function hasNotifier(env: Env): boolean {
   const twilio = Boolean(
@@ -207,7 +261,9 @@ async function checkOne(env: Env, url: string, threshold: number): Promise<boole
 
   if (probe.ok) {
     if (prev.status === "down") {
-      await notify(env, `Foghorn: ${smsHost(host)} is back UP.`);
+      if (await notify(env, `Foghorn: ${smsHost(host)} is back UP.`)) {
+        logPaged(`UP for ${logHost(url)}`);
+      }
       await saveState(env, url, { status: "up", fails: 0 });
     } else if (prev.fails !== 0) {
       // a partial failure streak recovered before reaching the threshold
@@ -224,7 +280,9 @@ async function checkOne(env: Env, url: string, threshold: number): Promise<boole
   }
   const fails = prev.fails + 1;
   if (fails >= threshold) {
-    await notify(env, downMessage(host, probe, fails));
+    if (await notify(env, downMessage(host, probe, fails))) {
+      logPaged(`DOWN for ${logHost(url)} after ${fails} failed checks`);
+    }
     await saveState(env, url, { status: "down", fails });
   } else {
     await saveState(env, url, { status: "up", fails });
@@ -518,7 +576,13 @@ function downMessage(rawHost: string, probe: Probe, fails: number): string {
  * the next cron run — a dead-man alarm must never mark an alert delivered
  * when nobody heard it.
  */
-async function notify(env: Env, body: string): Promise<void> {
+/**
+ * @returns whether any notifier ACCEPTED the alert — false when none is
+ * configured. Throws NotifyError when every configured notifier rejects. This
+ * return value is the single source of truth for "an alert left the building";
+ * do not re-derive it from env, which is the duplication logPaged used to have.
+ */
+async function notify(env: Env, body: string): Promise<boolean> {
   const tasks: Promise<void>[] = [];
   if (env.TWILIO_ACCOUNT_SID && env.TWILIO_AUTH_TOKEN && env.TWILIO_FROM && env.TWILIO_TO) {
     tasks.push(sendSms(env, body));
@@ -528,12 +592,13 @@ async function notify(env: Env, body: string): Promise<void> {
   }
   if (tasks.length === 0) {
     console.error(`Foghorn: no notifier configured — dropped alert: ${body}`);
-    return;
+    return false;
   }
   const results = await Promise.allSettled(tasks);
   if (results.every((r) => r.status === "rejected")) {
     throw new NotifyError(`Foghorn: every notifier failed — alert will retry next run: ${body}`);
   }
+  return true;
 }
 
 /**
@@ -632,8 +697,9 @@ async function runSyntheticTest(
     return;
   }
 
+  let sent: boolean;
   try {
-    await notify(env, SYNTHETIC_MESSAGE);
+    sent = await notify(env, SYNTHETIC_MESSAGE);
   } catch (err) {
     console.error(
       `Foghorn: SYNTHETIC DELIVERY TEST FAILED (${errName(err)}) — ` +
@@ -643,6 +709,21 @@ async function runSyntheticTest(
     await deliveryAlarm(env, false);
     return;
   }
+  // notify() returns false when nothing was configured to send through. That is
+  // NOT proof the path works — it is the opposite — but it does not throw, so
+  // this used to fall straight through to deliveryAlarm(true) and stamp the
+  // interval as proven. Unreachable today only because the hasNotifier() gate
+  // above duplicates notify()'s own predicate; if those two ever drift, the
+  // canary would report "Twilio works" having sent nothing. Fail it explicitly
+  // instead of relying on a guard in another function.
+  if (!sent) {
+    console.error(
+      "Foghorn: SYNTHETIC DELIVERY TEST had no notifier to send through — not counting it as proof.",
+    );
+    await deliveryAlarm(env, false);
+    return;
+  }
+  logPaged("the scheduled delivery test");
   await deliveryAlarm(env, true);
 
   try {
